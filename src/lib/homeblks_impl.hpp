@@ -15,32 +15,36 @@
  *********************************************************************************/
 
 #pragma once
+#include <future>
 #include <map>
 #include <string>
 #include <sisl/fds/id_reserver.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/utility/obj_life_counter.hpp>
-#include <homestore/crc.h>
+#include <homestore/crc.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
 #include <homestore/superblk_handler.hpp>
 #include <homestore/fault_cmt_service.hpp>
-#include <homeblks/home_blks.hpp>
-#include <homeblks/volume_mgr.hpp>
-#include <homeblks/common.hpp>
+#include "hb_internal.hpp"
 #include "volume/volume.hpp"
 #include "volume/volume_chunk_selector.hpp"
 
 namespace homeblocks {
 
-class Volume;
+class volume;
 
 struct hs_chunk_size_cfg_t {
     uint64_t index;
     uint64_t data;
 };
 
-class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enable_shared_from_this< HomeBlocksImpl > {
+class HomeBlocksImpl : public home_blocks, public std::enable_shared_from_this< HomeBlocksImpl > {
+    // The free data-plane functions need the system-level guards (restricted / shutting-down / fake-io delay).
+    friend async_result< size_t > async_read(volume_handle const&, uint64_t, sisl::sg_list);
+    friend async_result< size_t > async_write(volume_handle const&, uint64_t, sisl::sg_list);
+    friend async_status async_unmap(volume_handle const&, uint64_t, uint64_t);
+
     struct homeblks_sb_t {
         uint64_t magic;
         uint32_t version;
@@ -65,13 +69,12 @@ private:
     static constexpr uint64_t MAX_VOL_IO_SIZE = 1 * Mi; // 1 MiB
 
 private:
-    /// Our SvcId retrieval and SvcId->IP mapping
-    std::weak_ptr< HomeBlocksApplication > _application;
-    folly::Executor::KeepAlive<> executor_;
+    /// bring-up configuration (devices, threads, app_mem_size, on_svc_id hook)
+    home_blocks_config config_;
 
-    /// Volume management
+    /// volume management
     mutable std::shared_mutex vol_lock_;
-    std::map< volume_id_t, VolumePtr > vol_map_;
+    std::map< volume_id_t, volume_handle > vol_map_;
 
     // index table map which only used during recovery;
     mutable std::shared_mutex index_lock_;
@@ -90,7 +93,7 @@ private:
     bool shutdown_started_{false};
     std::atomic< bool > is_restricted_{false}; // avoid taking lock in IO path;
 
-    folly::Promise< folly::Unit > shutdown_promise_;
+    std::promise< void > shutdown_promise_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
 
@@ -99,7 +102,7 @@ public:
     static shared< HomeBlocksImpl > s_instance_;
 
 public:
-    explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
+    explicit HomeBlocksImpl(home_blocks_config&& cfg);
 
     ~HomeBlocksImpl() override = default;
     HomeBlocksImpl(const HomeBlocksImpl&) = delete;
@@ -107,11 +110,8 @@ public:
     HomeBlocksImpl& operator=(const HomeBlocksImpl&) = delete;
     HomeBlocksImpl& operator=(HomeBlocksImpl&&) noexcept = delete;
 
-    shared< VolumeManager > volume_manager() final;
-
-    /// HomeBlocks
-    /// Returns the UUID of this HomeBlocks.
-    HomeBlocksStats get_stats() const final;
+    /// home_blocks
+    home_blocks_stats get_stats() const final;
     iomgr::drive_type data_drive_type() const final;
 
     peer_id_t our_uuid() const final { return our_uuid_; }
@@ -120,26 +120,15 @@ public:
 
     void shutdown() final;
 
-    /// VolumeManager
-    NullAsyncResult create_volume(VolumeInfo&& vol_info) final;
+    /// volume control plane
+    [[nodiscard]] async_result< volume_handle > create_volume(volume_info info) final;
 
-    NullAsyncResult remove_volume(const volume_id_t& id) final;
+    [[nodiscard]] async_status remove_volume(const volume_id_t& id) final;
 
-    VolumePtr lookup_volume(const volume_id_t& id) final;
+    [[nodiscard]] result< volume_handle > get_volume(const volume_id_t& id) const final;
 
-    NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
-
-    NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
-
-    NullAsyncResult unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
-
-    // Submit the io batch, which is a mandatory method to be called if read/write are issued
-    // with part_of_batchis set to true.
-    void submit_io_batch() final;
-
-    // see api comments in base class;
-    bool get_stats(volume_id_t id, VolumeStats& stats) const final;
-    void get_volume_ids(std::vector< volume_id_t >& vol_ids) const final;
+    [[nodiscard]] result< volume_stats > get_stats(volume_id_t id) const final;
+    std::vector< volume_id_t > volume_ids() const final;
 
     // Index
     shared< hs_index_table_t > recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
@@ -153,14 +142,15 @@ public:
     void on_init_complete();
 
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
-                  const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
+                  const std::vector< homestore::multi_blk_id >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
     void start_reaper_thread();
 
-    void fault_containment(const VolumePtr vol, const std::string& reason = "");
+    void fault_containment(const volume_handle vol, const std::string& reason = "");
     bool fc_on() const;
-    void exit_fc(VolumePtr& vol);
+    void exit_fc(volume_handle& vol);
     bool is_restricted() const { return is_restricted_.load(); }
+    bool is_shutting_down() const { return shutdown_started_; }
     hs_chunk_size_cfg_t get_chunk_size() const;
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
 
@@ -179,11 +169,9 @@ private:
     void superblk_init();
     void register_metablk_cb();
 
-    void get_dev_info(shared< HomeBlocksApplication > app, std::vector< homestore::dev_info >& device_info,
-                      bool& has_data_dev, bool& has_fast_dev);
+    void get_dev_info(std::vector< homestore::dev_info >& device_info, bool& has_data_dev, bool& has_fast_dev);
 
-    DevType get_device_type(std::string const& devname);
-    auto defer() const { return folly::makeSemiFuture().via(executor_); }
+    dev_type get_device_type(std::string const& devname);
 
     void update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids);
 
@@ -193,24 +181,27 @@ private:
 
     void vol_gc();
 
+    // Coroutine driving the actual volume teardown (co_awaits volume::destroy); launched via detach on a
+    // worker reactor by remove_volume so the reactor yields during the destroy's CP flush instead of parking.
+    sisl::async::task< void > do_remove_volume(volume_id_t id);
+
     uint64_t gc_timer_nsecs() const;
 
     void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
     void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
-    bool is_shutting_down() const { return shutdown_started_; }
     bool can_shutdown() const;
 
     bool no_outstanding_vols() const;
 
-    folly::Future< folly::Unit > shutdown_start();
+    std::future< void > shutdown_start();
     void do_shutdown();
     uint64_t shutdown_timer_nsecs() const;
 
 #ifdef _PRERELEASE
     // For testing purpose only
     // If delay flip is not set, false will be returned;
-    // If delay flip is set, it will delay the IOs for a given VolumePtr
-    bool delay_fake_io(VolumePtr vol);
+    // If delay flip is set, it will delay the IOs for a given volume_handle
+    bool delay_fake_io(volume_handle vol);
     bool crash_simulated_{false};
 #endif
 };
@@ -247,11 +238,15 @@ public:
         }
 
         auto vol_id = static_cast< volume_id_t* >(cookie);
-        auto vol = hb_->lookup_volume(*vol_id);
+        auto vol = hb_->get_volume(*vol_id);
+        if (!vol) {
+            LOGW("Fault containment event for unknown volume {}, ignoring", boost::uuids::to_string(*vol_id));
+            return;
+        }
         if (event == homestore::FaultContainmentEvent::ENTER) {
-            hb_->fault_containment(vol, reason);
+            hb_->fault_containment(*vol, reason);
         } else if (event == homestore::FaultContainmentEvent::EXIT) {
-            hb_->exit_fc(vol);
+            hb_->exit_fc(*vol);
         }
     }
 

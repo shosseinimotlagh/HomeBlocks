@@ -3,13 +3,10 @@
 namespace homeblocks {
 
 /// NOTE: We give ourselves the option to provide a different HR instance here than libhomeblocks.a
-extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application) {
-    return std::make_shared< MemoryHomeBlocks >(std::move(application));
+result< shared< home_blocks > > init_homeblocks(home_blocks_config cfg) {
+    return shared< home_blocks >(std::make_shared< MemoryHomeBlocks >(std::move(cfg)));
 }
 
-MemoryHomeBlocks::MemoryHomeBlocks(std::weak_ptr< HomeBlocksApplication >&& application) :
-        HomeBlocksImpl::HomeBlocksImpl(std::move(application)) {
-    // _our_id = _application.lock()->discover_svcid(std::nullopt);
-}
+MemoryHomeBlocks::MemoryHomeBlocks(home_blocks_config&& cfg) : HomeBlocksImpl::HomeBlocksImpl(std::move(cfg)) {}
 
 } // namespace homeblocks

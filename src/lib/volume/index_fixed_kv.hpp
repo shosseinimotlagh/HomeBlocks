@@ -3,10 +3,10 @@
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/index_service.hpp>
 #include <homestore/index/index_internal.hpp>
-#include <homestore/blk.h>
+#include <homestore/blk.hpp>
 #include <sisl/fds/buffer.hpp>
 
-using homestore::BlkId;
+using homestore::blk_id;
 using homestore::BtreeKey;
 using homestore::BtreeValue;
 
@@ -15,8 +15,8 @@ using lba_t = std::uint64_t;
 
 struct BlockInfo {
     // Checksum calculated on new data and written to new_blkid.
-    homestore::BlkId new_blkid;
-    homestore::BlkId old_blkid;
+    homestore::blk_id new_blkid;
+    homestore::blk_id old_blkid;
     homestore::csum_t new_checksum;
     homestore::csum_t old_checksum{0};
 };
@@ -33,7 +33,7 @@ public:
     VolumeIndexKey(const VolumeIndexKey& other) = default;
     VolumeIndexKey(const BtreeKey& other) : VolumeIndexKey(other.serialize(), true) {}
     VolumeIndexKey(const sisl::blob& b, bool copy) : homestore::BtreeKey() {
-        VolumeIndexKey const* other = r_cast< VolumeIndexKey const* >(b.cbytes());
+        VolumeIndexKey const* other = reinterpret_cast< VolumeIndexKey const* >(b.cbytes());
         m_lba = other->m_lba;
     }
 
@@ -45,7 +45,7 @@ public:
 
     /////////////////// Overriding methods of BtreeKey /////////////////
     int compare(homestore::BtreeKey const& o) const override {
-        VolumeIndexKey const& other = s_cast< VolumeIndexKey const& >(o);
+        VolumeIndexKey const& other = static_cast< VolumeIndexKey const& >(o);
         if (m_lba < other.m_lba) {
             return -1;
         } else if (m_lba > other.m_lba) {
@@ -56,14 +56,15 @@ public:
     }
 
     sisl::blob serialize() const override {
-        return sisl::blob{uintptr_cast(const_cast< VolumeIndexKey* >(this)), uint32_cast(sizeof(VolumeIndexKey))};
+        return sisl::blob{reinterpret_cast< uint8_t* >(const_cast< VolumeIndexKey* >(this)),
+                          static_cast< uint32_t >(sizeof(VolumeIndexKey))};
     }
 
     uint32_t serialized_size() const override { return sizeof(VolumeIndexKey); }
 
     void deserialize(sisl::blob const& b, bool copy) override {
         assert(b.size() == sizeof(VolumeIndexKey));
-        VolumeIndexKey const* other = r_cast< VolumeIndexKey const* >(b.cbytes());
+        VolumeIndexKey const* other = reinterpret_cast< VolumeIndexKey const* >(b.cbytes());
         m_lba = other->m_lba;
     }
 
@@ -101,35 +102,35 @@ class VolumeIndexValue : public homestore::BtreeValue {
 private:
 #pragma pack(1)
     // Store blkid and checksum as the value.
-    BlkId m_blkid;
+    blk_id m_blkid;
     homestore::csum_t m_checksum;
 #pragma pack()
 
 public:
-    VolumeIndexValue(const BlkId& base_blkid, homestore::csum_t csum) :
+    VolumeIndexValue(const blk_id& base_blkid, homestore::csum_t csum) :
             homestore::BtreeValue(), m_blkid(base_blkid), m_checksum(csum) {}
-    VolumeIndexValue(const BlkId& base_blkid) : VolumeIndexValue(base_blkid, 0) {}
+    VolumeIndexValue(const blk_id& base_blkid) : VolumeIndexValue(base_blkid, 0) {}
     VolumeIndexValue() = default;
     VolumeIndexValue(const VolumeIndexValue& other) :
             homestore::BtreeValue(), m_blkid(other.m_blkid), m_checksum(other.m_checksum) {}
     VolumeIndexValue(const sisl::blob& b, bool copy) : homestore::BtreeValue() { this->deserialize(b, copy); }
     virtual ~VolumeIndexValue() = default;
 
-    homestore::BlkId blkid() const { return m_blkid; }
+    homestore::blk_id blkid() const { return m_blkid; }
 
     homestore::csum_t checksum() const { return m_checksum; }
 
     ///////////////////////////// Overriding methods of BtreeValue //////////////////////////
     VolumeIndexValue& operator=(const VolumeIndexValue& other) = default;
     sisl::blob serialize() const override {
-        sisl::blob b{r_cast< uint8_t const* >(this), sizeof(VolumeIndexValue)};
+        sisl::blob b{reinterpret_cast< uint8_t const* >(this), sizeof(VolumeIndexValue)};
         return b;
     }
 
     uint32_t serialized_size() const override { return sizeof(VolumeIndexValue); }
     static uint32_t get_fixed_size() { return sizeof(VolumeIndexValue); }
     void deserialize(const sisl::blob& b, bool) {
-        VolumeIndexValue const* other = r_cast< VolumeIndexValue const* >(b.cbytes());
+        VolumeIndexValue const* other = reinterpret_cast< VolumeIndexValue const* >(b.cbytes());
         m_blkid = other->m_blkid;
         m_checksum = other->m_checksum;
     }
@@ -146,7 +147,7 @@ public:
         uint32_t offset;
         char dummy;
         is >> base_val >> dummy >> offset;
-        v = VolumeIndexValue{BlkId{}};
+        v = VolumeIndexValue{blk_id{}};
         return is;
     }
 

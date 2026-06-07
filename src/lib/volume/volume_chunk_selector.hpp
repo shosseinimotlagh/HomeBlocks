@@ -14,13 +14,13 @@
  *********************************************************************************/
 #pragma once
 
+#include <atomic>
 #include <list>
-#include <folly/ThreadLocal.h>
-#include <homestore/chunk_selector.h>
-#include <homestore/vchunk.h>
+#include <homestore/chunk_selector.hpp>
+#include <homestore/vchunk.hpp>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/homestore.hpp>
-#include "homeblks/common.hpp"
+#include "hb_internal.hpp"
 
 namespace homeblocks {
 
@@ -46,11 +46,12 @@ class VolumeChunkSelector : public homestore::ChunkSelector {
 
         // max_num_chunks is total chunks possible for whole volume
         // size. num_active_chunks is the number of chunks which is
-        // used for allocation. next_chunk_index is thread local
-        // which does round robin on the active chunks
+        // used for allocation. m_next_chunk_index is a shared atomic cursor
+        // that round-robins (lock-free) over the active chunks; select_chunk()
+        // runs without the selector mutex, so this must be atomic.
         uint64_t max_num_chunks;
         std::atomic< uint64_t > num_active_chunks{0};
-        folly::ThreadLocal< uint32_t > m_next_chunk_index;
+        std::atomic< uint32_t > m_next_chunk_index{0};
         uint64_t ordinal;
         uint32_t pdev;
     };

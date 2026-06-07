@@ -22,51 +22,52 @@ public:
 
     std::shared_ptr< hs_index_table_t > index_table() { return hs_index_table_; }
 
-    VolumeManager::Result< folly::Unit > write_to_index(lba_t start_lba, lba_t end_lba,
-                                                        std::unordered_map< lba_t, BlockInfo >& blocks_info) {
+    status write_to_index(lba_t start_lba, lba_t end_lba, std::unordered_map< lba_t, BlockInfo >& blocks_info) {
         // Use filter callback to get the old blkid.
         homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
                                                               BtreeValue const& value) {
-            auto lba = r_cast< const VolumeIndexKey& >(key).key();
-            blocks_info[lba].old_blkid = r_cast< const VolumeIndexValue& >(existing_value).blkid();
+            auto lba = reinterpret_cast< const VolumeIndexKey& >(key).key();
+            blocks_info[lba].old_blkid = reinterpret_cast< const VolumeIndexValue& >(existing_value).blkid();
             return homestore::put_filter_decision::replace;
         };
 
         // Write to prefix btree with key ranging from start_lba to end_lba.
         // For value shift() will get the blk_num and checksum for each lba.
         IndexValueContext app_ctx{&blocks_info, start_lba};
-        const BlkId& start_blkid = blocks_info[start_lba].new_blkid;
+        const blk_id& start_blkid = blocks_info[start_lba].new_blkid;
         VolumeIndexValue value{start_blkid, blocks_info[start_lba].new_checksum};
 
         auto req = homestore::BtreeRangePutRequest< VolumeIndexKey >{
             homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{start_lba}, true, VolumeIndexKey{end_lba}, true},
             homestore::btree_put_type::UPSERT,
-            r_cast< VolumeIndexValue* >(&value),
-            r_cast< void* >(&app_ctx),
+            reinterpret_cast< VolumeIndexValue* >(&value),
+            reinterpret_cast< void* >(&app_ctx),
             std::numeric_limits< uint32_t >::max() /* batch_size */,
             filter_cb};
         auto result = hs_index_table_->put(req);
         if (result != homestore::btree_status_t::success) {
             LOGERROR("Failed to put to index range=({},{}) error={}", start_lba, end_lba, result);
-            return std::unexpected(VolumeError::INDEX_ERROR);
+            return std::unexpected(volume_error::INDEX_ERROR);
         }
 
-        return folly::Unit();
+        return ok();
     }
 
-    VolumeManager::Result< folly::Unit > read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs) {
+    status read_from_index(lba_t start_lba, lba_t end_lba, index_kv_list_t& index_kvs) {
         homestore::BtreeQueryRequest< VolumeIndexKey > qreq{
-            homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
+            homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{start_lba}, VolumeIndexKey{end_lba}},
             homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
         if (auto ret = hs_index_table_->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
-            return std::unexpected(VolumeError::INDEX_ERROR);
+            return std::unexpected(volume_error::INDEX_ERROR);
         }
-        return folly::Unit();
+        return ok();
     }
 
-    void destroy() {
+    sisl::async::task< void > destroy() {
         homestore::hs()->index_service().remove_index_table(hs_index_table_);
-        hs_index_table_->destroy();
+        // IndexTable::destroy() is a coroutine (co_awaits a forced CP flush); co_await it so the caller's
+        // reactor yields rather than blocking the flush.
+        co_await hs_index_table_->destroy();
     }
 };
 

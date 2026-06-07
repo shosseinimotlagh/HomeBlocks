@@ -13,7 +13,7 @@
  *
  *********************************************************************************/
 #include "volume_chunk_selector.hpp"
-#include <homeblks/common.hpp>
+#include "hb_internal.hpp"
 #include <iomgr/iomgr_flip.hpp>
 
 namespace homeblocks {
@@ -122,7 +122,7 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
 #ifdef _PRERELEASE
         if (iomgr_flip::instance()->test_flip("vol_num_chunks_force_resize_op")) {
             // this is to simulate no blks available.
-            LOGI("Volume resize op flip is set.");
+            LOGI("volume resize op flip is set.");
             resize_volume_num_chunks(nblks, volc);
         }
 #endif
@@ -141,10 +141,9 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
         // virtual_dev will call select_chunk again.
         uint64_t num_active_chunks = volc->num_active_chunks;
         for (uint64_t i = 0; i < num_active_chunks; i++) {
-            if (*volc->m_next_chunk_index >= num_active_chunks) { *volc->m_next_chunk_index = 0; }
-
-            auto chunk = volc->m_chunks[*volc->m_next_chunk_index];
-            *volc->m_next_chunk_index = ((*volc->m_next_chunk_index) + 1);
+            // Lock-free round-robin over the active chunks (shared atomic cursor).
+            auto const idx = volc->m_next_chunk_index.fetch_add(1, std::memory_order_relaxed) % num_active_chunks;
+            auto chunk = volc->m_chunks[idx];
             if (chunk && chunk->available_blks() > 0) { return chunk->get_internal_chunk(); }
         }
 
@@ -177,7 +176,7 @@ void VolumeChunkSelector::resize_volume_num_chunks(homestore::blk_count_t nblks,
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("vol_num_chunks_force_resize_op")) {
         // this is to simulate no blks available.
-        LOGI("Volume resize op flip is set.");
+        LOGI("volume resize op flip is set.");
         force_resize = true;
     }
 #endif
@@ -268,7 +267,7 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
                                          const std::vector< chunk_num_t >& chunk_ids) {
     std::lock_guard lock(m_chunk_sel_mutex);
     auto volc = m_volume_chunks[volume_ordinal];
-    RELEASE_ASSERT(!volc, "Volume already exists");
+    RELEASE_ASSERT(!volc, "volume already exists");
 
     auto chunk_size = m_all_chunks.begin()->second->size();
     volc = std::make_shared< VolumeChunksInfo >();
@@ -312,7 +311,7 @@ void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
     std::string str;
     uint64_t count = 0;
     auto volc = m_volume_chunks[volume_ordinal];
-    RELEASE_ASSERT(volc, "Volume doesnt exists");
+    RELEASE_ASSERT(volc, "volume doesnt exists");
 
     for (auto chunk : volc->m_chunks) {
         if (chunk) {

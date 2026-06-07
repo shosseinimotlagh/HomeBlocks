@@ -15,13 +15,11 @@
 
 #include <string>
 
-#include <folly/init/Init.h>
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
 #include <sisl/flip/flip_client.hpp>
 #include <iomgr/iomgr_flip.hpp>
-#include <homeblks/home_blks.hpp>
-#include <homeblks/volume_mgr.hpp>
+#include "hb_internal.hpp"
 #include "test_common.hpp"
 
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
@@ -44,12 +42,12 @@ class VolumeTest : public ::testing::Test {
 public:
     void SetUp() override {}
 
-    VolumeInfo gen_vol_info(uint32_t vol_idx) {
-        VolumeInfo vol_info;
+    volume_info gen_vol_info(uint32_t vol_idx) {
+        volume_info vol_info;
         vol_info.name = "vol_" + std::to_string(vol_idx);
         vol_info.size_bytes = 1024 * 1024 * 1024;
         vol_info.page_size = 4096;
-        vol_info.id = hb_utils::gen_random_uuid();
+        vol_info.id = boost::uuids::random_generator()();
         return vol_info;
     }
 };
@@ -59,7 +57,7 @@ TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
 
         uint32_t delay_sec = 6;
         g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 2, 100);
@@ -70,20 +68,17 @@ TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
             auto vinfo = gen_vol_info(i);
             auto id = vinfo.id;
             vol_ids.emplace_back(id);
-            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
             ASSERT_TRUE(ret);
 
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
 
-            // fake a write that will be delayed;
-            vol_interface_req_ptr req1(new vol_interface_req{nullptr, 0, 0, vol_ptr});
-            vol_mgr->write(vol_ptr, req1);
-
-            // fake a read that will be delayed;
-            vol_interface_req_ptr req2(new vol_interface_req{nullptr, 0, 0, vol_ptr});
-            vol_mgr->read(vol_ptr, req2);
+            // fake a write + read that will be delayed (the delay flip keeps them outstanding on the volume)
+            sisl::sg_list fake_sgs{.size = 0, .iovs = {iovec{nullptr, 0}}};
+            homeblocks::detail::detach(homeblocks::async_write(vol_ptr, 0, fake_sgs));
+            homeblocks::detail::detach(homeblocks::async_read(vol_ptr, 0, fake_sgs));
         }
 
         auto const s = hb->get_stats();
@@ -92,7 +87,7 @@ TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
 
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto id = vol_ids[i];
-            auto ret = vol_mgr->remove_volume(id).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
             ASSERT_TRUE(ret);
         }
     }
@@ -106,7 +101,7 @@ TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
 
         uint32_t delay_sec = 6;
         g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 2, 100);
@@ -116,20 +111,17 @@ TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
             auto vinfo = gen_vol_info(i);
             auto id = vinfo.id;
             vol_ids.emplace_back(id);
-            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
             ASSERT_TRUE(ret);
 
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
 
-            // fake a write that will be delayed;
-            vol_interface_req_ptr req1(new vol_interface_req{nullptr, 0, 0, vol_ptr});
-            vol_mgr->write(vol_ptr, req1);
-
-            // fake a read that will be delayed;
-            vol_interface_req_ptr req2(new vol_interface_req{nullptr, 0, 0, vol_ptr});
-            vol_mgr->read(vol_ptr, req2);
+            // fake a write + read that will be delayed (the delay flip keeps them outstanding on the volume)
+            sisl::sg_list fake_sgs{.size = 0, .iovs = {iovec{nullptr, 0}}};
+            homeblocks::detail::detach(homeblocks::async_write(vol_ptr, 0, fake_sgs));
+            homeblocks::detail::detach(homeblocks::async_read(vol_ptr, 0, fake_sgs));
         }
     }
 
@@ -143,7 +135,7 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
 
         uint32_t delay_sec = 6;
         g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 2, 100);
@@ -154,20 +146,17 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
             auto vinfo = gen_vol_info(i);
             auto id = vinfo.id;
             vol_ids.emplace_back(id);
-            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
             ASSERT_TRUE(ret);
 
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
 
-            // fake a write that will be delayed;
-            vol_interface_req_ptr req1(new vol_interface_req{nullptr, 0, 0, vol_ptr});
-            vol_mgr->write(vol_ptr, req1);
-
-            // fake a read that will be delayed;
-            vol_interface_req_ptr req2(new vol_interface_req{nullptr, 0, 0, vol_ptr});
-            vol_mgr->read(vol_ptr, req2);
+            // fake a write + read that will be delayed (the delay flip keeps them outstanding on the volume)
+            sisl::sg_list fake_sgs{.size = 0, .iovs = {iovec{nullptr, 0}}};
+            homeblocks::detail::detach(homeblocks::async_write(vol_ptr, 0, fake_sgs));
+            homeblocks::detail::detach(homeblocks::async_read(vol_ptr, 0, fake_sgs));
         }
 
         auto const s = hb->get_stats();
@@ -176,15 +165,15 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto id = vol_ids[i];
-            auto ret = vol_mgr->remove_volume(id).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
             ASSERT_TRUE(ret);
             while (true) {
                 auto delay_secs = 1;
-                LOGINFO("Remove Volume {} triggered, waiting for {} seconds for IO to complete",
+                LOGINFO("Remove volume {} triggered, waiting for {} seconds for IO to complete",
                         boost::uuids::to_string(id), delay_secs);
                 // sleep for a while
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_secs * 1000));
-                auto vol_ptr = vol_mgr->lookup_volume(id);
+                auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
                 if (!vol_ptr) { break; }
             }
         }
@@ -200,7 +189,7 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
 
         auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
 
@@ -208,10 +197,10 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
             auto vinfo = gen_vol_info(i);
             auto id = vinfo.id;
             vol_ids.emplace_back(id);
-            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
             ASSERT_TRUE(ret);
 
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
         }
@@ -222,11 +211,11 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
 
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto id = vol_ids[i];
-            auto ret = vol_mgr->remove_volume(id).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
             ASSERT_TRUE(ret);
             // sleep for a while
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
 
             // verify the volume is not there
             ASSERT_TRUE(vol_ptr == nullptr);
@@ -240,7 +229,7 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
 
         auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
 
@@ -248,10 +237,10 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             auto vinfo = gen_vol_info(i);
             auto id = vinfo.id;
             vol_ids.emplace_back(id);
-            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
             ASSERT_TRUE(ret);
 
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
         }
@@ -262,10 +251,10 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
     // verify the volumes are still there
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
 
         for (const auto& id : vol_ids) {
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
         }
@@ -273,13 +262,13 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
 
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
         for (const auto& id : vol_ids) {
-            auto ret = vol_mgr->remove_volume(id).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
             ASSERT_TRUE(ret);
             // sleep for a while
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is not there
             ASSERT_TRUE(vol_ptr == nullptr);
         }
@@ -293,7 +282,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
+        auto vol_mgr = hb;
 
         auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
 
@@ -301,17 +290,17 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
             auto vinfo = gen_vol_info(i);
             auto id = vinfo.id;
             vol_ids.emplace_back(id);
-            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
             ASSERT_TRUE(ret);
 
-            auto vol_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
         }
 
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto id = vol_ids[i];
-            auto ret = vol_mgr->remove_volume(id).get();
+            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
             ASSERT_TRUE(ret);
         }
     }
@@ -331,8 +320,6 @@ int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&parsed_argc, argv);
     SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_setup, homeblocks);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
-    parsed_argc = 1;
-    auto f = ::folly::Init(&parsed_argc, &argv, true);
 
     g_helper = std::make_unique< test_common::HBTestHelper >("test_volume", args, orig_argv);
     g_helper->setup();

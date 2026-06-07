@@ -22,13 +22,12 @@ public:
 
     std::shared_ptr< hs_index_table_t > index_table() { return hs_index_table_; }
 
-    VolumeManager::Result< folly::Unit > write_to_index(lba_t start_lba, lba_t end_lba,
-                                                        std::unordered_map< lba_t, BlockInfo >& blocks_info) {
+    status write_to_index(lba_t start_lba, lba_t end_lba, std::unordered_map< lba_t, BlockInfo >& blocks_info) {
         // Use filter callback to get the old blkid.
         homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
                                                               BtreeValue const& value) {
-            auto lba = r_cast< const VolumeIndexKey& >(key).lba();
-            auto& existing_value_vol_idx = r_cast< const VolumeIndexValue& >(existing_value);
+            auto lba = reinterpret_cast< const VolumeIndexKey& >(key).lba();
+            auto& existing_value_vol_idx = reinterpret_cast< const VolumeIndexValue& >(existing_value);
             blocks_info[lba].old_blkid = existing_value_vol_idx.blkid();
             blocks_info[lba].old_checksum = existing_value_vol_idx.checksum();
             return homestore::put_filter_decision::replace;
@@ -52,7 +51,7 @@ public:
                     // restore the blkid at this lba to the old value
                     LOGINFO("vol_index_partial_put_failure flip is set, aborting");
                     value = VolumeIndexValue{blocks_info[lba].old_blkid, blocks_info[lba].old_checksum};
-                    blocks_info[lba].old_blkid = homestore::BlkId{};
+                    blocks_info[lba].old_blkid = homestore::blk_id{};
                     blocks_info[lba].old_checksum = 0;
                     auto req1 = homestore::BtreeSinglePutRequest{&key, &value, homestore::btree_put_type::UPSERT};
                     if (auto restore_lba_result = hs_index_table_->put(req1);
@@ -67,19 +66,19 @@ public:
                 LOGERROR("Failed to put to index {}, error={}", lba, result);
                 // rollback the lbas for which we have already written to the index table
                 rollback_write(start_lba, lba - 1, blocks_info);
-                return std::unexpected(VolumeError::INDEX_ERROR);
+                return std::unexpected(volume_error::INDEX_ERROR);
             }
         }
 
-        return folly::Unit();
+        return ok();
     }
 
-    VolumeManager::NullResult read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs) {
+    status read_from_index(lba_t start_lba, lba_t end_lba, index_kv_list_t& index_kvs) {
         homestore::BtreeQueryRequest< VolumeIndexKey > qreq{
-            homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
+            homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{start_lba}, VolumeIndexKey{end_lba}},
             homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
         if (auto ret = hs_index_table_->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
-            return std::unexpected(VolumeError::INDEX_ERROR);
+            return std::unexpected(volume_error::INDEX_ERROR);
         }
         return {};
     }
@@ -104,9 +103,11 @@ public:
         }
     }
 
-    void destroy() {
+    sisl::async::task< void > destroy() {
         homestore::hs()->index_service().remove_index_table(hs_index_table_);
-        hs_index_table_->destroy();
+        // IndexTable::destroy() is a coroutine (co_awaits a forced CP flush); co_await it so the caller's
+        // reactor yields rather than blocking the flush.
+        co_await hs_index_table_->destroy();
     }
 };
 

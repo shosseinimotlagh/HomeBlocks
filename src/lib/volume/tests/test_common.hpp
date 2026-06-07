@@ -13,26 +13,28 @@
  *
  *********************************************************************************/
 /*
- * HomeBlocks Testing Binaries shared common define, apis and data structure;
+ * home_blocks Testing Binaries shared common define, apis and data structure;
  * */
 #pragma once
 #include <fcntl.h>
+#include <future>
 #include <string>
 #include <vector>
 #include <map>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 #include <sisl/settings/settings.hpp>
+#include <sisl/http/http_server.hpp>
 #include <iomgr/io_environment.hpp>
-#include <iomgr/http_server.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/nil_generator.hpp>
 #include <boost/uuid/random_generator.hpp>
 #include <chrono>
 #include <iostream>
 #include <thread>
-#include <homeblks/home_blks.hpp>
+#include "hb_internal.hpp"
 #include "lib/homeblks_impl.hpp"
+#include "coro_helpers.hpp"
 
 SISL_OPTION_GROUP(
     test_common_setup,
@@ -65,19 +67,16 @@ using namespace homeblocks;
 
 class test_http_server {
 public:
-    void get_prometheus_metrics(const Pistache::Rest::Request&, Pistache::Http::ResponseWriter response) {
-        response.send(Pistache::Http::Code::Ok,
-                      sisl::MetricsFarm::getInstance().report(sisl::ReportFormat::kTextFormat));
-    }
-
+    // sisl's HttpServer moved from Pistache to httplib (handlers are httplib::Request/Response).
     void start() {
         auto http_server_ptr = ioenvironment.get_http_server();
-
-        std::vector< iomgr::http_route > routes = {
-            {Pistache::Http::Method::Get, "/metrics",
-             Pistache::Rest::Routes::bind(&test_http_server::get_prometheus_metrics, this), iomgr::url_t::safe}};
         try {
-            http_server_ptr->setup_routes(routes);
+            http_server_ptr->setup_routes(
+                {{sisl::http_method::Get, "/metrics",
+                  [](httplib::Request const&, httplib::Response& res) {
+                      res.set_content(sisl::MetricsFarm::getInstance().report(sisl::TEXT_FORMAT), "text/plain");
+                  },
+                  sisl::url_type::safe}});
             LOGINFO("Started http server ");
         } catch (std::runtime_error const& e) { LOGERROR("setup routes failed, {}", e.what()) }
 
@@ -89,7 +88,8 @@ public:
 namespace test_common {
 
 struct io_fiber_pool {
-    std::vector< iomgr::io_fiber_t > io_fibers_;
+    // iomgr v13 exposes reactors (IOReactor*) rather than fibers (io_fiber_t); run_on_forget takes an IOReactor*.
+    std::vector< iomgr::IOReactor* > io_fibers_;
     io_fiber_pool(uint32_t num_io_reactors) {
         struct Context {
             std::condition_variable cv;
@@ -98,12 +98,12 @@ struct io_fiber_pool {
         };
         auto ctx = std::make_shared< Context >();
         for (uint32_t i{0}; i < num_io_reactors; ++i) {
-            iomanager.create_reactor("homeblks_long_running_io" + std::to_string(i), iomgr::INTERRUPT_LOOP, 1u,
+            iomanager.create_reactor("homeblks_long_running_io" + std::to_string(i), iomgr::INTERRUPT_LOOP,
                                      [this, ctx](bool is_started) {
                                          if (is_started) {
                                              {
                                                  std::unique_lock< std::mutex > lk{ctx->mtx};
-                                                 io_fibers_.push_back(iomanager.iofiber_self());
+                                                 io_fibers_.push_back(iomanager.this_reactor());
                                                  ++(ctx->thread_cnt);
                                              }
                                              ctx->cv.notify_one();
@@ -128,7 +128,7 @@ struct Runner {
     std::atomic< uint64_t > issued_tasks_{0};
     std::atomic< uint64_t > completed_tasks_{0};
     std::function< void(void) > task_;
-    folly::Promise< folly::Unit > comp_promise_;
+    std::promise< void > comp_promise_;
     std::shared_ptr< io_fiber_pool > io_fiber_pool_;
 
     Runner(uint64_t num_tasks, uint32_t qd = 8, std::shared_ptr< io_fiber_pool > const& g_io_fiber_pool = nullptr) :
@@ -143,15 +143,15 @@ struct Runner {
     void set_task(std::function< void(void) > f) {
         issued_tasks_.store(0);
         completed_tasks_.store(0);
-        comp_promise_ = folly::Promise< folly::Unit >{};
+        comp_promise_ = std::promise< void >{};
         task_ = std::move(f);
     }
 
-    folly::Future< folly::Unit > execute() {
+    std::future< void > execute() {
         for (uint32_t i{0}; i < qdepth_; ++i) {
             run_task();
         }
-        return comp_promise_.getFuture();
+        return comp_promise_.get_future();
     }
 
     void next_task() {
@@ -159,7 +159,7 @@ struct Runner {
         if ((issued_tasks_.load() < total_tasks_)) {
             run_task();
         } else if ((ctasks + 1) == total_tasks_) {
-            comp_promise_.setValue();
+            comp_promise_.set_value();
         }
     }
 
@@ -180,56 +180,45 @@ struct Runner {
 struct Waiter {
     std::atomic< uint64_t > expected_comp{0};
     std::atomic< uint64_t > actual_comp{0};
-    folly::Promise< folly::Unit > comp_promise;
+    std::promise< void > comp_promise;
 
     Waiter(uint64_t num_op) : expected_comp{num_op} {}
     Waiter() : Waiter{SISL_OPTIONS["num_io"].as< uint64_t >()} {}
     Waiter(const Waiter&) = delete;
     Waiter& operator=(const Waiter&) = delete;
 
-    folly::Future< folly::Unit > start(std::function< void(void) > f) {
+    std::future< void > start(std::function< void(void) > f) {
         f();
-        return comp_promise.getFuture();
+        return comp_promise.get_future();
     }
 
     void one_complete() {
-        if ((actual_comp.fetch_add(1) + 1) >= expected_comp.load()) { comp_promise.setValue(); }
+        if ((actual_comp.fetch_add(1) + 1) >= expected_comp.load()) { comp_promise.set_value(); }
     }
 };
 
+// Block until every future is satisfied. Uses wait() rather than get() so the same vector can be awaited more than once
+// and never throws on a value-only (void) completion.
+inline void wait_all(std::vector< std::future< void > >& futs) {
+    for (auto& f : futs) {
+        if (f.valid()) { f.wait(); }
+    }
+}
+
 class HBTestHelper {
-    class HBTestApplication : public homeblocks::HomeBlocksApplication {
-    private:
-        HBTestHelper& helper_;
-
-    public:
-        HBTestApplication(HBTestHelper& h) : helper_{h} {}
-        virtual ~HBTestApplication() = default;
-
-        // implement all the virtual functions in HomeObjectApplication
-        bool spdk_mode() const override {
-            // return SISL_OPTIONS["spdk"].as< bool >();
-            return false;
+    // Build the bring-up config from test options. on_svc_id is a lazy coroutine that hands homeblocks our
+    // (cold-boot) svc id; it only fires on first boot -- on restart the id is recovered from the superblock.
+    homeblocks::home_blocks_config make_config() {
+        homeblocks::home_blocks_config cfg;
+        cfg.threads = SISL_OPTIONS["num_threads"].as< uint32_t >();
+        cfg.app_mem_size_mb = 20 * 1024; // 20 GiB
+        for (const auto& dev : dev_list()) {
+            cfg.devices.emplace_back(dev);
         }
-        uint32_t threads() const override { return SISL_OPTIONS["num_threads"].as< uint32_t >(); }
-
-        std::list< device_info_t > devices() const override {
-            std::list< device_info_t > devs;
-            for (const auto& dev : helper_.dev_list()) {
-                devs.emplace_back(dev);
-            }
-            return devs;
-        }
-
-        std::optional< peer_id_t > discover_svc_id(std::optional< peer_id_t > const&) const override {
-            return helper_.svc_id();
-        }
-
-        uint64_t app_mem_size() const override {
-            // return SISL_OPTIONS["app_mem_size"].as< uint64_t >();
-            return 20;
-        }
-    };
+        auto id = svc_id();
+        cfg.on_svc_id = [id]() -> homeblocks::async_result< homeblocks::peer_id_t > { co_return id; };
+        return cfg;
+    }
 
 public:
     HBTestHelper(std::string const& name, std::vector< std::string > const& args, char** argv) :
@@ -245,23 +234,26 @@ public:
         // init device list
         init_dev_list(true /*init_device*/);
 
-        LOGINFO("Starting HomeBlocks");
+        LOGINFO("Starting home_blocks");
         // homeblocks::HomeBlocksImpl::_hs_chunk_size = SISL_OPTIONS["hs_chunk_size_mb"].as< uint64_t >() * Mi;
         // set_min_chunk_size(4 * Mi);
-        app_ = std::make_shared< HBTestApplication >(*this);
-        hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
+        auto hb = init_homeblocks(make_config());
+        RELEASE_ASSERT(hb.has_value(), "init_homeblocks failed");
+        hb_ = hb.value();
     }
 
     void restart(uint64_t delay_secs = 0) {
-        LOGINFO("Restart HomeBlocks");
+        LOGINFO("Restart home_blocks");
         hb_->shutdown();
         hb_.reset();
-        LOGINFO("Start HomeBlocks after {} secs", delay_secs);
+        LOGINFO("Start home_blocks after {} secs", delay_secs);
         if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
-        hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
+        auto hb = init_homeblocks(make_config());
+        RELEASE_ASSERT(hb.has_value(), "init_homeblocks failed on restart");
+        hb_ = hb.value();
     }
 
-    shared< homeblocks::HomeBlocks > inst() { return hb_; }
+    shared< homeblocks::home_blocks > inst() { return hb_; }
 
     void teardown() {
         LOGINFO("Tearing down test.");
@@ -276,14 +268,14 @@ public:
     Waiter& waiter() { return waiter_; }
 
     static void fill_data_buf(uint8_t* buf, uint64_t size, uint64_t pattern = 0) {
-        uint64_t* ptr = r_cast< uint64_t* >(buf);
+        uint64_t* ptr = reinterpret_cast< uint64_t* >(buf);
         for (uint64_t i = 0ul; i < size / sizeof(uint64_t); ++i) {
             *(ptr + i) = (pattern == 0) ? i : pattern;
         }
     }
 
     static void validate_data_buf(uint8_t const* buf, uint64_t size, uint64_t pattern = 0) {
-        uint64_t const* ptr = r_cast< uint64_t const* >(buf);
+        uint64_t const* ptr = reinterpret_cast< uint64_t const* >(buf);
         for (uint64_t i = 0ul; i < size / sizeof(uint64_t); ++i) {
             RELEASE_ASSERT_EQ(ptr[i], ((pattern == 0) ? i : pattern), "data_buf mismatch at offset={}", i);
         }
@@ -396,8 +388,7 @@ private:
     std::vector< std::string > args_;
     char** argv_;
     std::vector< std::string > dev_list_;
-    shared< homeblocks::HomeBlocks > hb_;
-    shared< HBTestApplication > app_;
+    shared< homeblocks::home_blocks > hb_;
     peer_id_t svc_id_;
     Runner io_runner_;
     Waiter waiter_;

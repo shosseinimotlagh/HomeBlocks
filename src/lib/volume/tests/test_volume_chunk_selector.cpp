@@ -1,12 +1,10 @@
 #include <string>
 #include <latch>
-#include <folly/init/Init.h>
 #include <gtest/gtest.h>
 #include <sisl/flip/flip_client.hpp>
 #include <iomgr/iomgr_flip.hpp>
 #include <sisl/options/options.h>
-#include <homeblks/home_blks.hpp>
-#include <homeblks/volume_mgr.hpp>
+#include "hb_internal.hpp"
 #include <volume/volume.hpp>
 #include <volume/volume_chunk_selector.hpp>
 #include "test_common.hpp"
@@ -243,8 +241,6 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogPattern("[%D %T%z] [%^%L%$] [%n] [%t] %v");
     ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = 4});
 
-    parsed_argc = 1;
-    auto f = ::folly::Init(&parsed_argc, &argv, true);
     auto ret = RUN_ALL_TESTS();
     iomanager.stop();
     return ret;

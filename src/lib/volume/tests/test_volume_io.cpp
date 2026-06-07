@@ -16,13 +16,11 @@
 #include <string>
 #include <latch>
 #include <boost/icl/interval_set.hpp>
-#include <folly/init/Init.h>
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
 #include <sisl/flip/flip_client.hpp>
 #include <iomgr/iomgr_flip.hpp>
-#include <homeblks/home_blks.hpp>
-#include <homeblks/volume_mgr.hpp>
+#include "hb_internal.hpp"
 #include <volume/volume.hpp>
 #include "test_common.hpp"
 
@@ -105,12 +103,12 @@ public:
     }
 
 private:
-    VolumeInfo gen_vol_info(uint32_t vol_idx) {
-        VolumeInfo vol_info;
+    volume_info gen_vol_info(uint32_t vol_idx) {
+        volume_info vol_info;
         vol_info.name = "vol_" + std::to_string(vol_idx);
         vol_info.size_bytes = SISL_OPTIONS["vol_size_gb"].as< uint32_t >() * Gi;
         vol_info.page_size = g_page_size;
-        vol_info.id = hb_utils::gen_random_uuid();
+        vol_info.id = boost::uuids::random_generator()();
         return vol_info;
     }
 
@@ -120,23 +118,23 @@ public:
         m_vol_name = vinfo.name;
         m_vol_id = vinfo.id;
 
-        auto vol_mgr = g_helper->inst()->volume_manager();
-        auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+        auto vol_mgr = g_helper->inst();
+        auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
         ASSERT_TRUE(ret);
 
-        m_vol_ptr = vol_mgr->lookup_volume(m_vol_id);
+        m_vol_ptr = vol_mgr->get_volume(m_vol_id).value_or(nullptr);
         ASSERT_TRUE(m_vol_ptr != nullptr);
     }
 
     void remove_volume() {
-        auto vol_mgr = g_helper->inst()->volume_manager();
-        auto ret = vol_mgr->remove_volume(m_vol_id).get();
+        auto vol_mgr = g_helper->inst();
+        auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(m_vol_id));
         ASSERT_TRUE(ret);
     }
 
     void reset() {
-        auto vol_mgr = g_helper->inst()->volume_manager();
-        m_vol_ptr = vol_mgr->lookup_volume(m_vol_id);
+        auto vol_mgr = g_helper->inst();
+        m_vol_ptr = vol_mgr->get_volume(m_vol_id).value_or(nullptr);
         ASSERT_TRUE(m_vol_ptr != nullptr);
     }
 
@@ -197,26 +195,34 @@ public:
         return data;
     }
 
+    // Build a single-iovec sg_list over `buf` of `nbytes`.
+    static sisl::sg_list make_sgs(uint8_t* buf, uint64_t nbytes) {
+        return sisl::sg_list{.size = nbytes, .iovs = {iovec{buf, nbytes}}};
+    }
+
+    // Coroutine body for a single write IO; co_returns whether the write succeeded. data is taken by value so its
+    // buffer outlives the co_await.
+    sisl::async::task< bool > do_write_io_single(lba_t start_lba, uint32_t nblks, sisl::byte_array data) {
+        auto const result = co_await homeblocks::async_write(m_vol_ptr, start_lba * g_page_size,
+                                                             make_sgs(data->bytes(), nblks * g_page_size));
+        {
+            std::lock_guard lock(m_mutex);
+            m_inflight_ios.erase(boost::icl::interval< int >::closed(start_lba, start_lba + nblks - 1));
+        }
+        co_return result.has_value();
+    }
+
     void generate_write_io_single(lba_t start_lba = 0, uint32_t nblks = 0, bool wait = true,
                                   bool expect_failure = false) {
         // Generate a single io with start lba and nblks.
-        auto latch = std::make_shared< std::latch >(1);
         auto data = build_random_data(start_lba, nblks, !expect_failure /*store the generated data*/);
-        vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks, m_vol_ptr});
-        auto vol_mgr = g_helper->inst()->volume_manager();
-        vol_mgr->write(m_vol_ptr, req)
-            .via(&folly::InlineExecutor::instance())
-            .thenValue([this, data, req, latch, expect_failure](auto&& result) {
-                ASSERT_EQ(!result.has_value(), expect_failure);
-                {
-                    std::lock_guard lock(m_mutex);
-                    m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
-                }
-
-                latch->count_down();
-            });
-
-        if (wait) { latch->wait(); }
+        if (wait) {
+            // Drive the write coroutine to completion on this (test) thread, then assert.
+            auto const succeeded = homeblocks::detail::sync_get(do_write_io_single(start_lba, nblks, data));
+            ASSERT_EQ(succeeded, !expect_failure);
+        } else {
+            homeblocks::detail::detach(do_write_io_single(start_lba, nblks, data));
+        }
     }
 
     auto generate_write_io_task(lba_t start_lba = 0, uint32_t nblks = 0) {
@@ -237,31 +243,31 @@ public:
         return m_read_runner->execute();
     }
 
+    // Coroutine body for one runner-driven write IO; chains the next runner task on completion.
+    sisl::async::task< void > do_write_io(lba_t start_lba, uint32_t nblks, sisl::byte_array data) {
+        auto const result = co_await homeblocks::async_write(m_vol_ptr, start_lba * g_page_size,
+                                                             make_sgs(data->bytes(), nblks * g_page_size));
+        RELEASE_ASSERT(result.has_value(), "Write failed with error={}", result.error());
+        {
+            std::lock_guard lock(m_mutex);
+            m_inflight_ios.erase(boost::icl::interval< int >::closed(start_lba, start_lba + nblks - 1));
+            LOGDEBUG("end write io start={} end={}", start_lba, start_lba + nblks - 1);
+        }
+        m_write_count++;
+        m_write_runner->next_task();
+    }
+
     void generate_write_io(lba_t start_lba = 0, uint32_t nblks = 0) {
         auto data = build_random_data(start_lba, nblks);
-        vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks, m_vol_ptr});
-        auto vol_mgr = g_helper->inst()->volume_manager();
-        LOGDEBUG("begin write io start={} end={}", req->lba, req->lba + req->nlbas - 1);
-        vol_mgr->write(m_vol_ptr, req)
-            .via(&folly::InlineExecutor::instance())
-            .thenValue([this, req, data](auto&& result) {
-                RELEASE_ASSERT(result.has_value(), "Write failed with error={}", result.error());
-                {
-                    std::lock_guard lock(m_mutex);
-                    m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
-                    LOGDEBUG("end write io start={} end={}", req->lba, req->lba + req->nlbas - 1);
-                }
-                m_write_count++;
-                m_write_runner->next_task();
-            });
+        LOGDEBUG("begin write io start={} end={}", start_lba, start_lba + nblks - 1);
+        homeblocks::detail::detach(do_write_io(start_lba, nblks, data));
     }
 
     void sync_read(lba_t start_lba, uint32_t nlbas) {
         auto sz = nlbas * m_vol_ptr->info()->page_size;
         sisl::io_blob_safe read_blob(sz, 512);
-        auto buf = read_blob.bytes();
-        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
-        auto read_resp = g_helper->inst()->volume_manager()->read(m_vol_ptr, req).get();
+        auto read_resp = homeblocks::detail::sync_get(
+            homeblocks::async_read(m_vol_ptr, start_lba * g_page_size, make_sgs(read_blob.bytes(), sz)));
         if (!read_resp.has_value()) { LOGERROR("Read failed with error={}", read_resp.error()); }
         RELEASE_ASSERT(read_resp.has_value(), "Read failed with error={}", read_resp.error());
     }
@@ -271,8 +277,8 @@ public:
         auto sz = nlbas * m_vol_ptr->info()->page_size;
         sisl::io_blob_safe read_blob(sz, 512);
         auto buf = read_blob.bytes();
-        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
-        auto read_resp = g_helper->inst()->volume_manager()->read(m_vol_ptr, req).get();
+        auto read_resp =
+            homeblocks::detail::sync_get(homeblocks::async_read(m_vol_ptr, start_lba * g_page_size, make_sgs(buf, sz)));
         if (!read_resp.has_value()) { LOGERROR("Read failed with error={}", read_resp.error()); }
         RELEASE_ASSERT(read_resp.has_value(), "Read failed with error={}", read_resp.error());
         auto read_sz = m_vol_ptr->info()->page_size;
@@ -286,8 +292,23 @@ public:
             }
 
             LOGDEBUG("Verify data lba={} pattern expected={} actual={}", lba, data_pattern,
-                     *r_cast< uint64_t* >(read_blob.bytes()));
+                     *reinterpret_cast< uint64_t* >(read_blob.bytes()));
         }
+    }
+
+    // Coroutine body for one runner-driven read IO; read_blob is moved into the frame so its buffer (which
+    // req points into) outlives the co_await. Chains the next runner task on completion.
+    sisl::async::task< void > do_read_io(lba_t start_lba, uint32_t nlbas, sisl::io_blob_safe read_blob) {
+        auto const result = co_await homeblocks::async_read(m_vol_ptr, start_lba * g_page_size,
+                                                            make_sgs(read_blob.bytes(), nlbas * g_page_size));
+        RELEASE_ASSERT(result.has_value(), "Read failed with error={}", result.error());
+        {
+            std::lock_guard lock(m_mutex);
+            m_inflight_ios.erase(boost::icl::interval< int >::closed(start_lba, start_lba + nlbas - 1));
+            LOGDEBUG("end read io start={} end={}", start_lba, start_lba + nlbas - 1);
+        }
+        m_read_count++;
+        m_read_runner->next_task();
     }
 
     void generate_read_io(lba_t start_lba = 0, uint32_t nlbas = 0) {
@@ -296,31 +317,13 @@ public:
         uint64_t max_blks = static_cast< uint64_t >(info->size_bytes) / page_size;
         get_random_non_overlapping_lba(start_lba, nlbas, max_blks);
         sisl::io_blob_safe read_blob(nlbas * page_size, 512);
-        auto buf = read_blob.bytes();
-        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
-        LOGDEBUG("begin read io start={} end={}", req->lba, req->lba + req->nlbas - 1);
-        auto read_resp =
-            g_helper->inst()
-                ->volume_manager()
-                ->read(m_vol_ptr, req)
-                .via(&folly::InlineExecutor::instance())
-                .thenValue([this, read_blob = std::move(read_blob), req](auto&& result) {
-                    RELEASE_ASSERT(result.has_value(), "Read failed with error={}", result.error());
-                    {
-                        std::lock_guard lock(m_mutex);
-                        m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
-                        LOGDEBUG("end read io start={} end={}", req->lba, req->lba + req->nlbas - 1);
-                    }
-                    m_read_count++;
-                    m_read_runner->next_task();
-                });
+        LOGDEBUG("begin read io start={} end={}", start_lba, start_lba + nlbas - 1);
+        homeblocks::detail::detach(do_read_io(start_lba, nlbas, std::move(read_blob)));
     }
 
     void verify_all_data(uint64_t nlbas_per_io = 1) {
-        auto start_lba = m_lba_data.begin()->first;
-        auto end_lba = m_lba_data.rbegin()->first;
-        LOGTRACE("Verifying data for volume {} from lba={} to lba={} with nlbas_per_io={}", m_vol_name, start_lba,
-                 end_lba, nlbas_per_io);
+        LOGTRACE("Verifying data for volume {} from lba={} to lba={} with nlbas_per_io={}", m_vol_name,
+                 m_lba_data.begin()->first, m_lba_data.rbegin()->first, nlbas_per_io);
         for (auto& [lba, _] : m_lba_data) {
             read_and_verify(lba, nlbas_per_io);
         }
@@ -342,7 +345,7 @@ public:
 private:
     std::mutex m_mutex;
     std::string m_vol_name;
-    VolumePtr m_vol_ptr;
+    volume_handle m_vol_ptr;
     volume_id_t m_vol_id;
     static inline uint32_t m_volume_id_{1};
     // Mapping from lba to data patttern.
@@ -394,7 +397,7 @@ public:
     auto generate_write_io(shared< VolumeIOImpl > vol = nullptr, lba_t start_lba = 0, uint32_t nblks = 0,
                            bool wait = true) {
         // Generate write io based on num_io and qdepth with start lba and nblks.
-        std::vector< folly::Future< folly::Unit > > futs;
+        std::vector< std::future< void > > futs;
         if (vol != nullptr) {
             futs.emplace_back(vol->generate_write_io_task(start_lba, nblks));
         } else {
@@ -404,7 +407,7 @@ public:
         }
 
         if (wait) {
-            folly::collectAll(futs).get();
+            test_common::wait_all(futs);
             LOGINFO("Write IO completed count={}", get_total_writes());
         }
 
@@ -414,7 +417,7 @@ public:
     auto generate_read_io(shared< VolumeIOImpl > vol = nullptr, lba_t start_lba = 0, uint32_t nblks = 0,
                           bool wait = true) {
         // Generate read io based on num_io and qdepth with start lba and nblks.
-        std::vector< folly::Future< folly::Unit > > futs;
+        std::vector< std::future< void > > futs;
         if (vol != nullptr) {
             futs.emplace_back(vol->generate_read_io_task(start_lba, nblks));
         } else {
@@ -424,7 +427,7 @@ public:
         }
 
         if (wait) {
-            folly::collectAll(futs).get();
+            test_common::wait_all(futs);
             LOGINFO("Read IO completed count={}", get_total_reads());
         }
 
@@ -589,7 +592,7 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
         uint64_t total_reads{0}, total_writes{0};
         auto start_time = std::chrono::high_resolution_clock::now();
         do {
-            std::vector< folly::Future< folly::Unit > > futs;
+            std::vector< std::future< void > > futs;
 
             // Generate write's on all volumes with random lba and nblks on all volumes.
             auto writes = generate_write_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
@@ -599,7 +602,7 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
 
             futs.insert(futs.end(), std::make_move_iterator(writes.begin()), std::make_move_iterator(writes.end()));
             futs.insert(futs.end(), std::make_move_iterator(reads.begin()), std::make_move_iterator(reads.end()));
-            folly::collectAll(futs).get();
+            test_common::wait_all(futs);
 
             total_reads += get_total_reads();
             total_writes += get_total_writes();
@@ -645,15 +648,15 @@ TEST_F(VolumeIOTest, LongRunningSequentialIO) {
     lba_count_t nblks = 100;
     uint64_t total_reads{0}, total_writes{0};
     do {
-        std::vector< folly::Future< folly::Unit > > futs;
+        std::vector< std::future< void > > futs;
 
         // Generate write's on all volumes with sequential lba and nblks on all volumes.
         auto writes = generate_write_io(nullptr /* vol */, cur_lba /* start_lba */, nblks, false /* wait */);
-        folly::collectAll(writes).get();
+        test_common::wait_all(writes);
 
         // Generate reads on all volumes with sequential lba and nblks on all volumes.
         auto reads = generate_read_io(nullptr /* vol */, cur_lba /* start_lba */, nblks, false /* wait */);
-        folly::collectAll(reads).get();
+        test_common::wait_all(reads);
 
         total_reads += get_total_reads();
         total_writes += get_total_writes();
@@ -693,12 +696,12 @@ TEST_F(VolumeIOTest, PerfRandomIo) {
 
     auto start_time = std::chrono::high_resolution_clock::now();
     do {
-        std::vector< folly::Future< folly::Unit > > futs;
+        std::vector< std::future< void > > futs;
 
         // Generate write's on all volumes with random lba and nblks on all volumes.
         auto ios = generate_random_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
         futs.insert(futs.end(), std::make_move_iterator(ios.begin()), std::make_move_iterator(ios.end()));
-        folly::collectAll(futs).get();
+        test_common::wait_all(futs);
         std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
         auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
         static uint64_t log_pct = 0;
@@ -725,11 +728,11 @@ TEST_F(VolumeIOTest, PerfSequentialIo) {
     lba_count_t nblks;
     do {
         get_random_nblks(nblks);
-        std::vector< folly::Future< folly::Unit > > futs;
+        std::vector< std::future< void > > futs;
 
         // Generate write's on all volumes with sequential lba and nblks on all volumes.
         auto ios = generate_random_io(nullptr /* vol */, cur_lba /* start_lba */, nblks, false /* wait */);
-        folly::collectAll(ios).get();
+        test_common::wait_all(ios);
 
         std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
         auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
@@ -824,8 +827,6 @@ int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&parsed_argc, argv);
     SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_io_setup, homeblocks, config);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
-    parsed_argc = 1;
-    auto f = ::folly::Init(&parsed_argc, &argv, true);
 
     g_helper = std::make_unique< test_common::HBTestHelper >("test_volume_io", args, orig_argv);
     g_helper->setup();

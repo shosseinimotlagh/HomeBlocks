@@ -6,7 +6,7 @@ target_sources(test_volume PRIVATE
 )
 
 target_link_libraries(test_volume
-    ${PROJECT_NAME}_volume
+    ${PROJECT_NAME}
     ${COMMON_TEST_DEPS}
     -rdynamic
 )
@@ -17,7 +17,7 @@ target_sources(test_volume_io PRIVATE
 )
 
 target_link_libraries(test_volume_io
-    ${PROJECT_NAME}_volume
+    ${PROJECT_NAME}
     ${COMMON_TEST_DEPS}
     -rdynamic
 )
@@ -27,7 +27,7 @@ target_sources(test_volume_chunk_selector PRIVATE
 test_volume_chunk_selector.cpp
 )
 target_link_libraries(test_volume_chunk_selector
-    ${PROJECT_NAME}_volume
+    ${PROJECT_NAME}
     ${COMMON_TEST_DEPS}
     -rdynamic
 )

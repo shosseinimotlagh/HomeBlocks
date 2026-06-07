@@ -1,4 +1,3 @@
-
 /*********************************************************************************
  * Modifications Copyright 2017-2019 eBay Inc.
  *
@@ -15,20 +14,17 @@
  *********************************************************************************/
 #pragma once
 
-#include <expected>
+// Internal homeblocks prelude: the public API (home_blocks.hpp) plus implementation-only logging shorthand,
+// size constants, and convenience aliases. NOT part of the public surface -- consumers include only
+// <homeblks/home_blocks.hpp>. Implementation TUs/headers include this instead.
 
-#include <boost/uuid/uuid.hpp>
 #include <boost/intrusive_ptr.hpp>
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wuninitialized"
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#include <folly/futures/Future.h>
-#pragma GCC diagnostic pop
+#include <boost/uuid/random_generator.hpp>
 #include <sisl/logging/logging.h>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/superblk_handler.hpp>
 
-SISL_LOGGING_DECL(homeblocks);
+#include <homeblks/home_blocks.hpp>
 
 #define HOMEBLOCKS_LOG_MODS homeblocks
 #define LOGT(...) LOGTRACEMOD(homeblocks, ##__VA_ARGS__)
@@ -49,45 +45,22 @@ constexpr uint64_t Gi = Ki * Mi;
 #endif
 
 namespace homeblocks {
-using peer_id_t = boost::uuids::uuid;
-using volume_id_t = boost::uuids::uuid;
 
-template < typename T >
+using lba_t = uint64_t;
+using lba_count_t = uint32_t;
+
+template < class T >
 using shared = std::shared_ptr< T >;
-
-template < typename T >
+template < class T >
 using cshared = const std::shared_ptr< T >;
-
-template < typename T >
+template < class T >
 using unique = std::unique_ptr< T >;
-
-template < typename T >
+template < class T >
 using intrusive = boost::intrusive_ptr< T >;
-
-template < typename T >
+template < class T >
 using cintrusive = const boost::intrusive_ptr< T >;
-
-template < typename T >
+template < class T >
 using superblk = homestore::superblk< T >;
-
-template < class E >
-class Manager {
-public:
-    template < typename T >
-    using Result = std::expected< T, E >;
-    template < typename T >
-    using AsyncResult = folly::Future< Result< T > >;
-
-    using NullResult = Result< void >;
-    using NullAsyncResult = AsyncResult< void >;
-
-    virtual ~Manager() = default;
-};
-
-class hb_utils {
-public:
-    static homestore::uuid_t gen_random_uuid();
-};
 
 static constexpr uint32_t MAX_NUM_VOLUMES = 2048;
 

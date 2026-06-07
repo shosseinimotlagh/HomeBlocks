@@ -17,11 +17,13 @@
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/nil_generator.hpp>
 #include <iomgr/io_environment.hpp>
+#include <iomgr/drive.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/replication_service.hpp>
 #include <sisl/options/options.h>
 #include "homeblks_impl.hpp"
 #include "listener.hpp"
+#include "coro_helpers.hpp"
 #include "home_blks_config.hpp"
 
 SISL_OPTION_GROUP(homeblocks,
@@ -32,9 +34,11 @@ SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
 
 namespace homeblocks {
 
-extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application) {
-    LOGI("Initializing HomeBlocks with reaper thread timer: {} seconds", HB_DYNAMIC_CONFIG(reaper_thread_timer_secs));
-    auto inst = std::make_shared< HomeBlocksImpl >(std::move(application));
+result< shared< home_blocks > > init_homeblocks(home_blocks_config cfg) {
+    LOGI("Initializing home_blocks with reaper thread timer: {} seconds", HB_DYNAMIC_CONFIG(reaper_thread_timer_secs));
+    auto inst = std::make_shared< HomeBlocksImpl >(std::move(cfg));
+    // TODO: surface operational init failures (on_svc_id RPC, device open, format) as result<> errors rather than
+    // aborting inside init_homestore(); precondition bugs (e.g. no devices) stay asserts.
     inst->init_homestore();
     inst->init_cp();
     inst->start_reaper_thread();
@@ -53,16 +57,16 @@ iomgr::drive_type HomeBlocksImpl::data_drive_type() const {
     }
 }
 
-HomeBlocksStats HomeBlocksImpl::get_stats() const {
+home_blocks_stats HomeBlocksImpl::get_stats() const {
     auto const stats = homestore::hs()->repl_service().get_cap_stats();
     return {stats.total_capacity, stats.used_capacity};
 }
 
-folly::Future< folly::Unit > HomeBlocksImpl::shutdown_start() {
+std::future< void > HomeBlocksImpl::shutdown_start() {
     LOGI("Setting shutdown start flag");
     shutdown_started_ = true;
 
-    auto f = shutdown_promise_.getFuture();
+    auto f = shutdown_promise_.get_future();
 
     auto const nsecs = shutdown_timer_nsecs();
     LOGI("Setting shutdown timer with {} seconds", nsecs);
@@ -129,7 +133,7 @@ void HomeBlocksImpl::do_shutdown() {
     if (can_shutdown()) {
         LOGI("No outstanding requests, proceeding with shutdown");
 
-        shutdown_promise_.setValue();
+        shutdown_promise_.set_value();
     } else {
         LOGI("Outstanding requests exist, will retry shutdown in {} seconds", shutdown_timer_nsecs());
     }
@@ -142,7 +146,7 @@ void HomeBlocksImpl::shutdown() {
     // start timer thread if there are still outstanding jobs;
     auto f = shutdown_start();
 
-    std::move(f).get();
+    f.get();
 
     // stop the timer thread
     if (shutdown_timer_hdl_ != iomgr::null_timer_handle) {
@@ -155,42 +159,28 @@ void HomeBlocksImpl::shutdown() {
     sb_.write();
 
     homestore::hs()->shutdown();
-    homestore::HomeStore::reset_instance();
+    homestore::home_store::reset_instance();
     iomanager.stop();
 
     reset_instance();
 }
 
-HomeBlocksImpl::HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application) :
-        _application(std::move(application)), sb_{HB_META_NAME} {
-    auto exe_type = SISL_OPTIONS["executor"].as< std::string >();
-    std::transform(exe_type.begin(), exe_type.end(), exe_type.begin(), ::tolower);
-
-    if ("immediate" == exe_type) [[likely]]
-        executor_ = &folly::QueuedImmediateExecutor::instance();
-    else if ("io" == exe_type)
-        executor_ = folly::getGlobalIOExecutor();
-    else if ("cpu" == exe_type)
-        executor_ = folly::getGlobalCPUExecutor();
-    else
-        RELEASE_ASSERT(false, "Unknown Folly Executor type: [{}]", exe_type);
-    LOGI("initialized with [executor={}]", exe_type);
+HomeBlocksImpl::HomeBlocksImpl(home_blocks_config&& cfg) : config_(std::move(cfg)), sb_{HB_META_NAME} {
     ordinal_reserver_ = std::make_unique< sisl::IDReserver >(MAX_NUM_VOLUMES);
 }
 
-DevType HomeBlocksImpl::get_device_type(std::string const& devname) {
-    const iomgr::drive_type dtype = iomgr::DriveInterface::get_drive_type(devname);
-    if (dtype == iomgr::drive_type::block_hdd || dtype == iomgr::drive_type::file_on_hdd) { return DevType::HDD; }
-    if (dtype == iomgr::drive_type::file_on_nvme || dtype == iomgr::drive_type::block_nvme) { return DevType::NVME; }
-    return DevType::UNSUPPORTED;
+dev_type HomeBlocksImpl::get_device_type(std::string const& devname) {
+    const iomgr::drive_type dtype = iomgr::type_of(devname);
+    if (dtype == iomgr::drive_type::block_hdd || dtype == iomgr::drive_type::file_on_hdd) { return dev_type::HDD; }
+    if (dtype == iomgr::drive_type::file_on_nvme || dtype == iomgr::drive_type::block_nvme) { return dev_type::NVME; }
+    return dev_type::UNSUPPORTED;
 }
 
 // repl application to init homestore
-class HBReplApp : public homestore::ReplApplication {
+class HBReplApp : public homestore::repl_application {
 public:
-    HBReplApp(homestore::repl_impl_type impl_type, bool tl_consistency, HomeBlocksImpl* hb,
-              std::weak_ptr< HomeBlocksApplication > ho_app) :
-            impl_type_(impl_type), tl_consistency_(tl_consistency), hb_(hb), ho_app_(ho_app) {}
+    HBReplApp(homestore::repl_impl_type impl_type, bool tl_consistency, HomeBlocksImpl* hb) :
+            impl_type_(impl_type), tl_consistency_(tl_consistency), hb_(hb) {}
 
     // TODO: make this override after the base class in homestore adds a virtual destructor
     virtual ~HBReplApp() = default;
@@ -201,7 +191,7 @@ public:
     bool need_timeline_consistency() const override { return tl_consistency_; }
 
     // this will be called by homestore when create_repl_dev is called;
-    std::shared_ptr< homestore::ReplDevListener > create_repl_dev_listener(homestore::group_id_t group_id) override {
+    std::shared_ptr< homestore::repl_dev_listener > create_repl_dev_listener(homestore::group_id_t group_id) override {
         return std::make_shared< HBListener >(hb_);
 #if 0
         std::scoped_lock lock_guard(_repl_sm_map_lock);
@@ -231,29 +221,28 @@ private:
     homestore::repl_impl_type impl_type_;
     bool tl_consistency_; // indicates whether this application needs timeline consistency;
     HomeBlocksImpl* hb_;
-    std::weak_ptr< HomeBlocksApplication > ho_app_;
 #if 0
     std::map< homestore::group_id_t, std::shared_ptr< HBListener> > _repl_sm_map;
     std::mutex _repl_sm_map_lock;
 #endif
 };
 
-void HomeBlocksImpl::get_dev_info(shared< HomeBlocksApplication > app, std::vector< homestore::dev_info >& dev_info,
-                                  bool& has_data_dev, bool& has_fast_dev) {
-    for (auto const& dev : app->devices()) {
+void HomeBlocksImpl::get_dev_info(std::vector< homestore::dev_info >& dev_info, bool& has_data_dev,
+                                  bool& has_fast_dev) {
+    for (auto const& dev : config_.devices) {
         auto input_dev_type = dev.type;
         auto detected_type = get_device_type(dev.path.string());
         LOGD("Device {} detected as {}", dev.path.string(), detected_type);
-        auto final_type = (dev.type == DevType::AUTO_DETECT) ? detected_type : input_dev_type;
-        if (final_type == DevType::UNSUPPORTED) {
+        auto final_type = (dev.type == dev_type::AUTO_DETECT) ? detected_type : input_dev_type;
+        if (final_type == dev_type::UNSUPPORTED) {
             LOGW("Device {} is not supported, skipping", dev.path.string());
             continue;
         }
-        if (input_dev_type != DevType::AUTO_DETECT && detected_type != final_type) {
+        if (input_dev_type != dev_type::AUTO_DETECT && detected_type != final_type) {
             LOGW("Device {} detected as {}, but input type is {}, using input type", dev.path.string(), detected_type,
                  input_dev_type);
         }
-        auto hs_type = (final_type == DevType::HDD) ? homestore::HSDevType::Data : homestore::HSDevType::Fast;
+        auto hs_type = (final_type == dev_type::HDD) ? homestore::HSDevType::Data : homestore::HSDevType::Fast;
         if (hs_type == homestore::HSDevType::Data) { has_data_dev = true; }
         if (hs_type == homestore::HSDevType::Fast) { has_fast_dev = true; }
         dev_info.emplace_back(std::filesystem::canonical(dev.path).string(), hs_type);
@@ -291,19 +280,15 @@ hs_chunk_size_cfg_t HomeBlocksImpl::get_chunk_size() const {
 }
 
 void HomeBlocksImpl::init_homestore() {
-    auto app = _application.lock();
-    RELEASE_ASSERT(app, "HomeObjectApplication lifetime unexpected!");
+    LOGI("Starting iomgr with {} threads", config_.threads);
+    ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = config_.threads}).with_http_server();
 
-    LOGI("Starting iomgr with {} threads, spdk: {}", app->threads(), false);
-    ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = app->threads(), .is_spdk = app->spdk_mode()})
-        .with_http_server();
-
-    const uint64_t app_mem_size = app->app_mem_size() * 1024 * 1024 * 1024;
+    const uint64_t app_mem_size = config_.app_mem_size_mb * 1024 * 1024;
     LOGI("Initialize and start HomeStore with app_mem_size = {}", app_mem_size);
 
     std::vector< homestore::dev_info > device_info;
     bool has_data_dev{false}, has_fast_dev{false};
-    get_dev_info(app, device_info, has_data_dev, has_fast_dev);
+    get_dev_info(device_info, has_data_dev, has_fast_dev);
 
     RELEASE_ASSERT(device_info.size() != 0, "No supported devices found!");
 
@@ -319,8 +304,7 @@ void HomeBlocksImpl::init_homestore() {
 
     using namespace homestore;
     // Note: timeline_consistency doesn't matter as we are using solo repl dev;
-    auto repl_app =
-        std::make_shared< HBReplApp >(repl_impl_type::solo, false /*timeline_consistency*/, this, _application);
+    auto repl_app = std::make_shared< HBReplApp >(repl_impl_type::solo, false /*timeline_consistency*/, this);
     bool need_format = false;
     if (fc_on()) {
         need_format = homestore::hs()
@@ -341,9 +325,15 @@ void HomeBlocksImpl::init_homestore() {
 
     auto const hs_chunk_sz = get_chunk_size();
     if (need_format) {
-        auto ret = app->discover_svc_id(std::nullopt);
-        DEBUG_ASSERT(ret.has_value(), "UUID should be generated by application.");
-        our_uuid_ = ret.value();
+        // Cold boot: ask the consumer's hook for our svc id (e.g. a gRPC to the OM), driven off-reactor here on
+        // the init thread. Empty hook -> generate one.
+        if (config_.on_svc_id) {
+            auto ret = detail::sync_get(config_.on_svc_id());
+            RELEASE_ASSERT(ret.has_value(), "on_svc_id hook failed to provide a svc id");
+            our_uuid_ = ret.value();
+        } else {
+            our_uuid_ = boost::uuids::random_generator()();
+        }
         LOGINFO("We are starting for the first time on svc_id: [{}]. Formatting HomeStore. ",
                 boost::uuids::to_string(our_uuid()));
         if (has_data_dev && has_fast_dev) {
@@ -394,8 +384,8 @@ void HomeBlocksImpl::init_homestore() {
     } else {
         // we are starting on an existing system;
         DEBUG_ASSERT(our_uuid() != boost::uuids::nil_uuid(), "UUID should be recovered from HB superblock!");
-        // now callback to application to nofity the uuid so that we are treated as an existing system;
-        app->discover_svc_id(our_uuid());
+        // Reboot: svc id recovered from the superblock; on_svc_id is cold-boot-only, so nothing to call here. A
+        // consumer that needs to re-announce on restart reads home_blocks::our_uuid() after init.
         LOGINFO("We are starting on [{}].", boost::uuids::to_string(our_uuid_));
     }
 
@@ -414,7 +404,7 @@ void HomeBlocksImpl::superblk_init() {
 }
 
 void HomeBlocksImpl::on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
-    sb_.load(buf, cookie);
+    sb_.load(buf, static_cast< homestore::meta_blk* >(cookie));
     // sb verification
     RELEASE_ASSERT_EQ(sb_->version, HB_SB_VER);
     RELEASE_ASSERT_EQ(sb_->magic, HB_SB_MAGIC);
@@ -447,7 +437,7 @@ void HomeBlocksImpl::register_metablk_cb() {
     homestore::hs()->meta_service().register_handler(
         HB_META_NAME,
         [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
-            on_hb_meta_blk_found(std::move(buf), voidptr_cast(mblk));
+            on_hb_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
         },
         nullptr /*recovery_comp_cb*/, true /* do_crc */);
 }
@@ -457,16 +447,16 @@ void HomeBlocksImpl::on_init_complete() {
     // Add anything that needs to be done here.
     using namespace homestore;
 
-    // Volume SB
+    // volume SB
     homestore::hs()->meta_service().register_handler(
-        Volume::VOL_META_NAME,
+        volume::VOL_META_NAME,
         [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
-            on_vol_meta_blk_found(std::move(buf), voidptr_cast(mblk));
+            on_vol_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
         },
         nullptr /*recovery_comp_cb*/, true /* do_crc */,
         std::optional< meta_subtype_vec_t >({homestore::hs()->repl_service().get_meta_blk_name()}));
 
-    homestore::hs()->meta_service().read_sub_sb(Volume::VOL_META_NAME);
+    homestore::hs()->meta_service().read_sub_sb(volume::VOL_META_NAME);
 }
 
 void HomeBlocksImpl::init_cp() {}
@@ -492,7 +482,7 @@ void HomeBlocksImpl::start_reaper_thread() {
 void HomeBlocksImpl::vol_gc() {
     LOGI("Running volume garbage collection");
     // loop through every volume and call remove volume if volume's ref_cnt is zero;
-    std::vector< VolumePtr > vols_to_remove;
+    std::vector< volume_handle > vols_to_remove;
     {
         auto lg = std::shared_lock(vol_lock_);
         for (auto& vol_pair : vol_map_) {
@@ -511,7 +501,9 @@ void HomeBlocksImpl::vol_gc() {
 
     for (auto& vol : vols_to_remove) {
         LOGI("Garbage Collecting removed volume with id: {}", vol->id_str());
-        remove_volume(vol->id());
+        // remove_volume is a coroutine (async_status) whose actual work is scheduled on a worker; we don't await
+        // it here, so start it fire-and-forget (an un-awaited lazy task would otherwise never run).
+        detail::detach(remove_volume(vol->id()));
     }
 }
 
@@ -524,9 +516,9 @@ bool HomeBlocksImpl::fc_on() const {
     return HB_DYNAMIC_CONFIG(fault_containment_on);
 }
 
-void HomeBlocksImpl::exit_fc(VolumePtr& vol) { vol->state_change(vol_state::ONLINE); }
+void HomeBlocksImpl::exit_fc(volume_handle& vol) { vol->state_change(volume_state::ONLINE); }
 
-void HomeBlocksImpl::fault_containment(const VolumePtr vol, const std::string& reason) {
+void HomeBlocksImpl::fault_containment(const volume_handle vol, const std::string& reason) {
     if (vol == nullptr) {
         // Put entire HB into offline;
         std::scoped_lock lg(sb_lock_);
@@ -537,9 +529,9 @@ void HomeBlocksImpl::fault_containment(const VolumePtr vol, const std::string& r
         return;
     }
 
-    LOGI("Volume {} is in fault containment due to: {}", vol->id_str(), reason);
+    LOGI("volume {} is in fault containment due to: {}", vol->id_str(), reason);
     // if volume is in fault containment, we should not allow any new requests to be issued on it;
-    vol->state_change(vol_state::OFFLINE);
+    vol->state_change(volume_state::OFFLINE);
 }
 
 shared< HomeBlocksImpl > HomeBlocksImpl::s_instance_ = nullptr;

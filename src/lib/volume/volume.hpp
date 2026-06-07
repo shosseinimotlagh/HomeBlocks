@@ -15,11 +15,17 @@
  *********************************************************************************/
 #pragma once
 
-#include <homeblks/volume_mgr.hpp>
+#include "hb_internal.hpp"
+#include <sisl/utility/obj_life_counter.hpp>
 #include "sisl/utility/enum.hpp"
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
-#include <homestore/replication/repl_dev.h>
+#include <homestore/replication/repl_dev.hpp>
+#include <iomgr/io_op.hpp>
+#include <sisl/async/task.hpp>
+#include <sisl/async/value_awaitable.hpp>
+#include <sisl/async/when_all.hpp>
+#include <sisl/metrics/metrics.hpp>
 
 #if USE_FIXED_INDEX
 #include "index_fixed_table.hpp"
@@ -28,19 +34,19 @@
 #endif
 
 #include "volume_chunk_selector.hpp"
+#include "io_req.hpp"
 #include "sisl/utility/atomic_counter.hpp"
-#include <homeblks/common.hpp>
 
 namespace homeblocks {
 
 using VolIdxTablePtr = shared< VolumeIndexTable >;
 
-using ReplDevPtr = shared< homestore::ReplDev >;
+using ReplDevPtr = shared< homestore::repl_dev >;
 using index_cfg_t = homestore::BtreeConfig;
 
-using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > >;
+using read_blks_list_t = std::vector< std::pair< lba_t, homestore::multi_blk_id > >;
 struct vol_read_ctx {
-    vol_interface_req_ptr vol_req;
+    const io_req* req;
     uint32_t blk_size;
     index_kv_list_t index_kvs{};
 };
@@ -62,35 +68,35 @@ struct MsgHeader {
     }
 };
 
-class VolumeMetrics : public sisl::MetricsGroupWrapper {
+class VolumeMetrics : public sisl::MetricsGroup {
 public:
-    explicit VolumeMetrics(const std::string& vol_name) : sisl::MetricsGroupWrapper("Volume", vol_name) {
+    explicit VolumeMetrics(const std::string& vol_name) : sisl::MetricsGroup("volume", vol_name) {
         // counters
-        REGISTER_COUNTER(volume_read_count, "Total Volume read operations", "volume_op_count", {"op", "read"});
-        REGISTER_COUNTER(volume_write_count, "Total Volume write operations", "volume_op_count", {"op", "write"});
-        REGISTER_COUNTER(volume_write_size_total, "Total Volume data size written", "volume_data_size",
+        REGISTER_COUNTER(volume_read_count, "Total volume read operations", "volume_op_count", {"op", "read"});
+        REGISTER_COUNTER(volume_write_count, "Total volume write operations", "volume_op_count", {"op", "write"});
+        REGISTER_COUNTER(volume_write_size_total, "Total volume data size written", "volume_data_size",
                          {"op", "write"});
-        REGISTER_COUNTER(volume_read_size_total, "Total Volume data size read", "volume_data_size", {"op", "read"});
+        REGISTER_COUNTER(volume_read_size_total, "Total volume data size read", "volume_data_size", {"op", "read"});
         // gauges
-        REGISTER_GAUGE(volume_data_used_size, "Total Volume data used size");
+        REGISTER_GAUGE(volume_data_used_size, "Total volume data used size");
         // histograms
         REGISTER_HISTOGRAM(volume_write_size_distribution, "Distribution of volume write sizes",
                            HistogramBucketsType(OpSizeBuckets));
         REGISTER_HISTOGRAM(volume_read_size_distribution, "Distribution of volume read sizes",
                            HistogramBucketsType(OpSizeBuckets));
-        REGISTER_HISTOGRAM(volume_read_latency, "Volume overall read latency", "volume_op_latency", {"op", "read"},
+        REGISTER_HISTOGRAM(volume_read_latency, "volume overall read latency", "volume_op_latency", {"op", "read"},
                            HistogramBucketsType(OpLatecyBuckets));
-        REGISTER_HISTOGRAM(volume_write_latency, "Volume overall write latency", "volume_op_latency", {"op", "write"},
+        REGISTER_HISTOGRAM(volume_write_latency, "volume overall write latency", "volume_op_latency", {"op", "write"},
                            HistogramBucketsType(OpLatecyBuckets));
-        REGISTER_HISTOGRAM(volume_data_read_latency, "Volume data blocks read latency", "volume_data_op_latency",
+        REGISTER_HISTOGRAM(volume_data_read_latency, "volume data blocks read latency", "volume_data_op_latency",
                            {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
-        REGISTER_HISTOGRAM(volume_data_write_latency, "Volume data blocks write latency", "volume_data_op_latency",
+        REGISTER_HISTOGRAM(volume_data_write_latency, "volume data blocks write latency", "volume_data_op_latency",
                            {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
-        REGISTER_HISTOGRAM(volume_map_read_latency, "Volume mapping read latency", "volume_map_op_latency",
+        REGISTER_HISTOGRAM(volume_map_read_latency, "volume mapping read latency", "volume_map_op_latency",
                            {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
-        REGISTER_HISTOGRAM(volume_map_write_latency, "Volume mapping write latency", "volume_map_op_latency",
+        REGISTER_HISTOGRAM(volume_map_write_latency, "volume mapping write latency", "volume_map_op_latency",
                            {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
-        REGISTER_HISTOGRAM(volume_journal_write_latency, "Volume journal write latency", "volume_journal_op_latency",
+        REGISTER_HISTOGRAM(volume_journal_write_latency, "volume journal write latency", "volume_journal_op_latency",
                            {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
 
         register_me_to_farm();
@@ -106,7 +112,7 @@ public:
     void on_gather();
 };
 
-class Volume : public std::enable_shared_from_this< Volume > {
+class volume : public std::enable_shared_from_this< volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
 private:
@@ -123,7 +129,7 @@ private:
         uint64_t size; // privisioned size in bytes of volume;
         volume_id_t id;
         char name[VOL_NAME_SIZE];
-        vol_state state{vol_state::INIT};
+        volume_state state{volume_state::INIT};
         uint64_t ordinal; // Id unique to local homeblk instance.
         uint32_t pdev_id; // All chunks for this volume allocated from this physical dev.
         uint32_t num_chunks;
@@ -152,46 +158,47 @@ private:
         }
 
         homestore::chunk_num_t* get_chunk_ids_mutable() {
-            return r_cast< homestore::chunk_num_t* >(uintptr_cast(this) + sizeof(vol_sb_t));
+            return reinterpret_cast< homestore::chunk_num_t* >(reinterpret_cast< uint8_t* >(this) + sizeof(vol_sb_t));
         }
 
         const homestore::chunk_num_t* get_chunk_ids() const {
-            return r_cast< const homestore::chunk_num_t* >(reinterpret_cast< const uint8_t* >(this) + sizeof(vol_sb_t));
+            return reinterpret_cast< const homestore::chunk_num_t* >(reinterpret_cast< const uint8_t* >(this) +
+                                                                     sizeof(vol_sb_t));
         }
     };
 
 public:
-    explicit Volume(VolumeInfo&& info, shared< VolumeChunkSelector > vol_chunk_sel,
+    explicit volume(volume_info&& info, shared< VolumeChunkSelector > vol_chunk_sel,
                     shared< VolumeChunkSelector > index_chunk_sel) :
             sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
-        vol_info_ = std::make_shared< VolumeInfo >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
+        vol_info_ = std::make_shared< volume_info >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
         metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     }
-    explicit Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > vol_chunk_sel,
+    explicit volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > vol_chunk_sel,
                     shared< VolumeChunkSelector > index_chunk_sel);
-    Volume(Volume const& volume) = delete;
-    Volume(Volume&& volume) = default;
-    Volume& operator=(Volume const& volume) = delete;
-    Volume& operator=(Volume&& volume) = default;
+    volume(volume const& volume) = delete;
+    volume(volume&& volume) = default;
+    volume& operator=(volume const& volume) = delete;
+    volume& operator=(volume&& volume) = default;
 
-    virtual ~Volume() = default;
+    virtual ~volume() = default;
 
     // static APIs exposed to HomeBlks Implementation Layer;
-    static VolumePtr make_volume(sisl::byte_view const& buf, void* cookie,
-                                 shared< VolumeChunkSelector > volume_chunk_sel,
-                                 shared< VolumeChunkSelector > index_chunk_sel) {
-        auto vol = std::make_shared< Volume >(buf, cookie, volume_chunk_sel, index_chunk_sel);
+    static volume_handle make_volume(sisl::byte_view const& buf, void* cookie,
+                                     shared< VolumeChunkSelector > volume_chunk_sel,
+                                     shared< VolumeChunkSelector > index_chunk_sel) {
+        auto vol = std::make_shared< volume >(buf, cookie, volume_chunk_sel, index_chunk_sel);
         auto ret = vol->init(true /*is_recovery*/);
         return ret ? vol : nullptr;
     }
-    void get_stats(VolumeStats& stats) const {
+    void get_stats(volume_stats& stats) const {
         stats.id = vol_info_->id;
         stats.state = sb_->state;
     }
 
-    static VolumePtr make_volume(VolumeInfo&& info, shared< VolumeChunkSelector > volume_chunk_sel,
-                                 shared< VolumeChunkSelector > index_chunk_sel) {
-        auto vol = std::make_shared< Volume >(std::move(info), volume_chunk_sel, index_chunk_sel);
+    static volume_handle make_volume(volume_info&& info, shared< VolumeChunkSelector > volume_chunk_sel,
+                                     shared< VolumeChunkSelector > index_chunk_sel) {
+        auto vol = std::make_shared< volume >(std::move(info), volume_chunk_sel, index_chunk_sel);
         auto ret = vol->init(false /* is_recovery */);
         // in failure case, volume shared ptr will be destroyed automatically;
         return ret ? vol : nullptr;
@@ -201,9 +208,9 @@ public:
     volume_id_t id() const { return vol_info_->id; };
     uint64_t ordinal() const { return vol_info_->ordinal; }
     std::string id_str() const { return boost::uuids::to_string(vol_info_->id); };
-    ReplDevPtr rd() const { return rd_; }
+    const ReplDevPtr& rd() const { return rd_; }
 
-    VolumeInfoPtr info() const { return vol_info_; }
+    volume_info_ptr info() const { return vol_info_; }
 
     std::string to_string() { return vol_info_->to_string(); }
 
@@ -213,17 +220,17 @@ public:
     VolIdxTablePtr init_index_table(bool is_recovery, VolIdxTablePtr tbl = nullptr);
     uint64_t get_index_size();
 
-    bool is_online() const { return m_state_.load() == vol_state::ONLINE; }
+    bool is_online() const { return m_state_.load() == volume_state::ONLINE; }
 
-    void destroy();
-    bool is_destroying() const { return m_state_.load() == vol_state::DESTROYING; }
+    sisl::async::task< void > destroy();
+    bool is_destroying() const { return m_state_.load() == volume_state::DESTROYING; }
     bool is_destroy_started() const { return destroy_started_.load(); }
-    bool is_offline() const { return m_state_.load() == vol_state::OFFLINE; }
+    bool is_offline() const { return m_state_.load() == volume_state::OFFLINE; }
 
     //
     // This API will be called to set the volume state and persist to disk;
     //
-    void state_change(vol_state s) {
+    void state_change(volume_state s) {
         if (sb_->state != s) {
             sb_->state = s;
             sb_.write();
@@ -231,12 +238,9 @@ public:
         }
     }
 
-    VolumeManager::NullAsyncResult write(const vol_interface_req_ptr& vol_req);
+    async_status write(io_req& vol_req);
 
-    VolumeManager::Result< folly::Unit > write_to_index(lba_t start_lba, lba_t end_lba,
-                                                        std::unordered_map< lba_t, BlockInfo >& blocks_info);
-
-    VolumeManager::NullAsyncResult read(const vol_interface_req_ptr& req);
+    async_status read(io_req& req);
 
     //
     // if destroy_started_ is true, it means volume destroy has started and we should not call remove again;
@@ -259,28 +263,38 @@ private:
     //
     bool init(bool is_recovery);
 
-    VolumeManager::NullResult verify_checksum(vol_read_ctx const& read_ctx);
+    status verify_checksum(vol_read_ctx const& read_ctx);
 
-    void submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,
-                                std::vector< folly::Future< std::error_code > >& futs);
+    void submit_read_to_backend(read_blks_list_t const& blks_to_read, const io_req& req,
+                                std::vector< sisl::async::task< iomgr::io_result > >& futs,
+                                std::vector< std::unique_ptr< sisl::sg_list > >& sgs_keepalive);
 
     void generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks_list_t& blks_to_read);
 
-    VolumeManager::NullResult read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs);
-
 private:
-    VolumeInfoPtr vol_info_;  // volume info
-    ReplDevPtr rd_;           // replication device for this volume, which provides read/write APIs to the volume;
-    VolIdxTablePtr indx_tbl_; // index table for this volume
-    superblk< vol_sb_t > sb_; // meta data of the volume
+    volume_info_ptr vol_info_; // volume info
+    ReplDevPtr rd_;            // replication device for this volume, which provides read/write APIs to the volume;
+    VolIdxTablePtr indx_tbl_;  // index table for this volume
+    superblk< vol_sb_t > sb_;  // meta data of the volume
     shared< VolumeChunkSelector > volume_chunk_selector_; // volume chunk selector.
     shared< VolumeChunkSelector > index_chunk_selector_;  // index chunk selector.
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0}; // number of outstanding requests
     std::atomic< bool > destroy_started_{
         false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
-    std::atomic< vol_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
+    std::atomic< volume_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
     std::unique_ptr< VolumeMetrics > metrics_;
+};
+
+// RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and
+// the volume stays alive). Replaces the refcount the old heap-allocated request carried; lives in the
+// async_read/async_write coroutine frame.
+struct vol_io_guard {
+    volume_handle vol;
+    explicit vol_io_guard(volume_handle v) : vol(std::move(v)) { vol->inc_ref(); }
+    ~vol_io_guard() { vol->dec_ref(); }
+    vol_io_guard(vol_io_guard const&) = delete;
+    vol_io_guard& operator=(vol_io_guard const&) = delete;
 };
 
 struct vol_repl_ctx : public homestore::repl_req_ctx {
@@ -288,7 +302,7 @@ struct vol_repl_ctx : public homestore::repl_req_ctx {
     sisl::io_blob_safe key_buf_;
 
     vol_repl_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : homestore::repl_req_ctx{} {
-        hdr_buf_ = std::move(sisl::io_blob_safe{uint32_cast(sizeof(MsgHeader) + hdr_extn_size), 0});
+        hdr_buf_ = std::move(sisl::io_blob_safe{static_cast< uint32_t >(sizeof(MsgHeader) + hdr_extn_size), 0});
         new (hdr_buf_.bytes()) MsgHeader();
 
         if (key_size) { key_buf_ = std::move(sisl::io_blob_safe{key_size, 0}); }
@@ -300,10 +314,10 @@ struct vol_repl_ctx : public homestore::repl_req_ctx {
 
     template < typename T >
     T* to() {
-        return r_cast< T* >(this);
+        return reinterpret_cast< T* >(this);
     }
 
-    MsgHeader* header() { return r_cast< MsgHeader* >(hdr_buf_.bytes()); }
+    MsgHeader* header() { return reinterpret_cast< MsgHeader* >(hdr_buf_.bytes()); }
     uint8_t* header_extn() { return hdr_buf_.bytes() + sizeof(MsgHeader); }
 
     sisl::io_blob_safe& header_buf() { return hdr_buf_; }
@@ -315,8 +329,12 @@ struct vol_repl_ctx : public homestore::repl_req_ctx {
 
 template < typename T >
 struct repl_result_ctx : public vol_repl_ctx {
-    folly::Promise< T > promise_;
-    VolumePtr vol_ptr_{nullptr};
+    // Cross-thread single-shot completion for the journal write. The producer
+    // (HomeBlocksImpl::on_write, on the commit thread) calls promise_.complete(value); the consumer
+    // (volume::write coroutine) co_awaits promise_ directly. This ctx is heap-allocated and kept alive by an
+    // intrusive_ptr through completion, satisfying value_awaitable's stable-address / outlive-the-await rule.
+    sisl::async::value_awaitable< T > promise_;
+    volume_handle vol_ptr_{nullptr};
 
     template < typename... Args >
     static intrusive< repl_result_ctx< T > > make(Args&&... args) {
@@ -324,7 +342,6 @@ struct repl_result_ctx : public vol_repl_ctx {
     }
 
     repl_result_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : vol_repl_ctx{hdr_extn_size, key_size} {}
-    folly::SemiFuture< T > result() { return promise_.getSemiFuture(); }
 };
 
 } // namespace homeblocks

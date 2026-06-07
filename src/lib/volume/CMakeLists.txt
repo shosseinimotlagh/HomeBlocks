@@ -2,15 +2,15 @@ cmake_minimum_required (VERSION 3.11)
 
 add_flags("-Wno-unused-parameter")
 
-add_library("${PROJECT_NAME}_volume")
+add_library("${PROJECT_NAME}")
 
-target_sources("${PROJECT_NAME}_volume" PRIVATE
+target_sources("${PROJECT_NAME}" PRIVATE
     volume.cpp
     volume_chunk_selector.cpp
     $<TARGET_OBJECTS:${PROJECT_NAME}_core>
 )
 
-target_link_libraries("${PROJECT_NAME}_volume" PUBLIC
+target_link_libraries("${PROJECT_NAME}" PUBLIC
     homestore::homestore
     ${COMMON_DEPS}
 )
