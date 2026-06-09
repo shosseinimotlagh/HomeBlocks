@@ -246,8 +246,6 @@ jobs:
         else sanitize="False"; fi
         conan create \
             -o sisl/*:malloc_impl=${{ inputs.malloc-impl }} \
-            -o iomgr/*:testing=off \
-            -o homestore/*:testing=off \
             -o homeblocks/*:sanitize=${sanitize} \
             -s:h build_type=${{ inputs.build-type }} \
             ${{ inputs.conan-channel != '' && format('--user oss --channel {0}', inputs.conan-channel) || '' }} \
@@ -259,8 +257,6 @@ jobs:
         python -m pip install gcovr
         conan build \
             -o sisl/*:malloc_impl=${{ inputs.malloc-impl }} \
-            -o iomgr/*:testing=off \
-            -o homestore/*:testing=off \
             -o homeblocks/*:coverage=True \
             -s:h build_type=${{ inputs.build-type }} \
             ${{ inputs.conan-channel != '' && format('--user oss --channel {0}', inputs.conan-channel) || '' }} \
