@@ -217,7 +217,6 @@ jobs:
         sudo rm -rf /usr/lib/llvm*
         sudo rm -rf /usr/lib/jvm
         sudo rm -rf /usr/lib/google-cloud-sdk
-        
         pushd import/ublkpp
         ./prepare_v2.sh
         conan export --user oss --channel ${{ inputs.conan-channel }}
@@ -247,7 +246,7 @@ jobs:
 
     - name: Create and Test Package
       run: |
-	conan cache clean -s -b
+        conan cache clean -s -b
         if [[ "${{ inputs.tooling }}" == "AddressSanitize" ]]; then sanitize="address"
         elif [[ "${{ inputs.tooling }}" == "ThreadSanitize" ]]; then sanitize="thread"
         else sanitize="False"; fi
@@ -261,7 +260,7 @@ jobs:
 
     - name: Code Coverage Run
       run: |
-	conan cache clean -s -b
+        conan cache clean -s -b
         python -m pip install gcovr
         conan build \
             -o sisl/*:malloc_impl=${{ inputs.malloc-impl }} \
