@@ -24,7 +24,7 @@ class HomeBlocksConan(ConanFile):
                 "shared": ['True', 'False'],
                 "fPIC": ['True', 'False'],
                 "coverage": ['True', 'False'],
-                "sanitize": ['True', 'False'],
+                "sanitize": ['address', 'thread', 'False'],
                 "fixed_index": [True, False],
               }
     default_options = {
@@ -40,8 +40,16 @@ class HomeBlocksConan(ConanFile):
     def configure(self):
         if self.options.shared:
             self.options.rm_safe("fPIC")
-        if self.options.coverage and self.options.sanitize:
-            raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
+        if self.settings.build_type == "Debug":
+            if self.options.coverage and self.options.sanitize:
+                raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
+            if self.conf.get("tools.build:skip_test", default=False):
+                if self.options.coverage or self.options.sanitize:
+                    raise ConanInvalidConfiguration("Coverage/Sanitizer requires Testing!")
+
+    def configure(self):
+        if self.settings.build_type != "Debug":
+            self.options['sisl/*'].malloc_impl = 'tcmalloc'
 
     def build_requirements(self):
         self.test_requires("gtest/[^1.17]")
@@ -58,8 +66,8 @@ class HomeBlocksConan(ConanFile):
 
     def layout(self):
         self.folders.source = "."
-        if self.options.get_safe("sanitize"):
-            self.folders.build = join("build", "Sanitized")
+        if self.options.get_safe("sanitize") and self.options.sanitize != "False":
+            self.folders.build = join("build", f"Sanitized-{self.options.sanitize}")
         elif self.options.get_safe("coverage"):
             self.folders.build = join("build", "Coverage")
         else:
@@ -86,12 +94,16 @@ class HomeBlocksConan(ConanFile):
         tc.variables["USE_FIXED_INDEX"] = "ON" if self.options.fixed_index else "OFF"
         if self.settings.build_type == "Debug":
             if self.options.get_safe("coverage"):
-                tc.variables['CODE_COVERAGE'] = 'ON'
-            elif self.options.get_safe("sanitize"):
-                tc.variables['MEMORY_SANITIZER_ON'] = 'ON'
+                tc.variables['BUILD_COVERAGE'] = 'ON'
+            elif self.options.get_safe("sanitize") and self.options.sanitize != "False":
+                if self.options.sanitize == "thread":
+                    tc.variables['THREAD_SANITIZER_ON'] = 'ON'
+                else:  # address
+                    tc.variables['ADDRESS_SANITIZER_ON'] = 'ON'
+        if self.settings.build_type != "Debug":
+            tc.variables['TCMALLOC_ON'] = 'ON'
         tc.generate()
 
-        # This generates "boost-config.cmake" and "grpc-config.cmake" etc in self.generators_folder
         deps = CMakeDeps(self)
         deps.generate()
 
@@ -119,10 +131,17 @@ class HomeBlocksConan(ConanFile):
         copy(self, "*.h*", join(self.source_folder, "src", "include"), join(self.package_folder, "include"), keep_path=True)
 
     def package_info(self):
-        if  self.options.sanitize:
-            self.cpp_info.sharedlinkflags.append("-fsanitize=address")
-            self.cpp_info.exelinkflags.append("-fsanitize=address")
-            self.cpp_info.sharedlinkflags.append("-fsanitize=undefined")
-            self.cpp_info.exelinkflags.append("-fsanitize=undefined")
-        elif self.options.coverage == 'True':
-            self.cpp_info.libs.append('gcov')
+        if self.options.get_safe("sanitize") and self.options.sanitize != "False":
+            if self.options.sanitize == "thread":
+                self.cpp_info.sharedlinkflags.append("-fsanitize=thread")
+                self.cpp_info.exelinkflags.append("-fsanitize=thread")
+            else:
+                self.cpp_info.sharedlinkflags.append("-fsanitize=address")
+                self.cpp_info.exelinkflags.append("-fsanitize=address")
+                self.cpp_info.sharedlinkflags.append("-fsanitize=undefined")
+                self.cpp_info.exelinkflags.append("-fsanitize=undefined")
+
+        self.cpp_info.set_property("cmake_file_name", "HomeBlocks")
+        self.cpp_info.set_property("cmake_target_name", "HomeBlocks::HomeBlocks")
+        self.cpp_info.names["cmake_find_package"] = "HomeBlocks"
+        self.cpp_info.names["cmake_find_package_multi"] = "HomeBlocks"
