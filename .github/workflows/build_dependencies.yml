@@ -176,6 +176,15 @@ jobs:
         fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
+    - name: Load Ublkpp Cache
+      uses: eBay/sisl/.github/actions/load_conan2@dev/v14.x
+      with:
+        testing: 'False'
+        path: import/ublkpp
+        key_prefix: UblkPPDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
+        fail_on_cache_miss: true
+      if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
+
     - name: Load HomeStore Cache
       uses: eBay/sisl/.github/actions/load_conan2@dev/v14.x
       with:
@@ -188,6 +197,14 @@ jobs:
     - name: Retrieve Dependencies
       uses: actions/checkout@v4
       with:
+        repository: szmyd/ublkpp
+        path: import/ublkpp
+        ref: main
+      if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
+
+    - name: Retrieve Dependencies
+      uses: actions/checkout@v4
+      with:
         repository: eBay/HomeStore
         path: import/homestore
         ref: dev/v8.x
@@ -195,6 +212,10 @@ jobs:
 
     - name: Prepare Recipes
       run: |
+        pushd import/ublkpp
+        ./prepare_v2.sh
+        conan export --user oss --channel ${{ inputs.conan-channel }}
+        popd
         pushd import/homestore
         conan export --user oss --channel ${{ inputs.conan-channel }}
         popd

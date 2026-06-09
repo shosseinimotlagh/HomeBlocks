@@ -63,6 +63,19 @@ jobs:
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
+  UblkppDeps:
+    needs: SislDeps
+    uses: szmyd/ublkpp/.github/workflows/build_dependencies.yml@main
+    with:
+      branch: main
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      compiler: ${{ inputs.compiler }}
+      conan-channel: ${{ inputs.conan-channel }}
+      tooling: None
+    if: ${{ github.event_name != 'pull_request' }}
+
   HomeStoreDeps:
     needs: [IOMgrDeps, NuraftMesgDeps]
     uses: eBay/homestore/.github/workflows/build_dependencies.yml@dev/v8.x
@@ -77,7 +90,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' }}
 
   HomeBlocksDeps:
-    needs: [HomeStoreDeps]
+    needs: [HomeStoreDeps, UblkppDeps]
     uses: ./.github/workflows/build_dependencies.yml
     with:
       branch: ${{ github.ref }}
