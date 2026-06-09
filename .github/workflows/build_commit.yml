@@ -67,7 +67,7 @@ jobs:
     needs: [IOMgrDeps, NuraftMesgDeps]
     uses: eBay/homestore/.github/workflows/build_dependencies.yml@dev/v8.x
     with:
-      branch: stable/v7.x
+      branch: dev/v8.x
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
