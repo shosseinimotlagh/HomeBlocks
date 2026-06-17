@@ -41,14 +41,9 @@ class HomeBlocksConan(ConanFile):
         if self.options.shared:
             self.options.rm_safe("fPIC")
         if self.settings.build_type == "Debug":
-            if self.options.coverage and self.options.sanitize:
+            if self.options.coverage and self.options.sanitize != 'False':
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
-            if self.conf.get("tools.build:skip_test", default=False):
-                if self.options.coverage or self.options.sanitize:
-                    raise ConanInvalidConfiguration("Coverage/Sanitizer requires Testing!")
-
-    def configure(self):
-        if self.settings.build_type != "Debug":
+        else:
             self.options['sisl/*'].malloc_impl = 'tcmalloc'
 
     def build_requirements(self):
@@ -115,6 +110,9 @@ class HomeBlocksConan(ConanFile):
             jobs = self.conf.get("tools.build:jobs", default=3)
             env = Environment()
             env.define("CTEST_PARALLEL_LEVEL", str(jobs))
+            if self.options.get_safe("sanitize") == "thread":
+                suppression_file = join(self.source_folder, "src", "test", "tsan_suppressions.txt")
+                env.define("TSAN_OPTIONS", f"suppressions={suppression_file}:second_deadlock_stack=1")
             with env.vars(self).apply():
                 cmake.test()
 

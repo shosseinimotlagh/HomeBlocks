@@ -1,0 +1,90 @@
+# TSAN suppressions for known false positives in homeblocks' dependency stack.
+#
+# All lock-order-inversions here are the GCC 13 coroutine resume mutex (an internal
+# unique_lock<mutex> inside coroutine_handle<>::resume()) interacting with sisl::when_all's
+# nested start_detached fan-out.  The same cycle (M0 = global coroutine mutex) appears in
+# every report; there is no homeblocks lock involved.
+#
+# All data races are stdexec / std::future / spdlog / sisl-metrics interactions whose
+# synchronization is invisible to TSAN.
+
+# --- lock-order-inversions ---------------------------------------------------
+
+# GCC 13 coroutine_handle::resume() internal mutex vs sisl::when_all nested scheduling
+deadlock:fan_run_one
+
+# iomgr/homestore internal mutex ordering during init — TSAN sees the homeblocks
+# call site but the mutexes are all iomgr-owned; false positive from test restarts
+# creating new HomeBlocksImpl instances (TSAN's lock-order graph persists across
+# object lifetimes and confuses mutexes from separate instances).
+deadlock:homeblocks::init_homeblocks
+
+# --- data races --------------------------------------------------------------
+
+# GCC 13 std::future/_State_baseV2 state touched concurrently by stdexec completion.
+# Entries without wildcards: exact/substring match for short names.
+# Entries with wildcards: glob match for template-instantiated long names
+# (_M_ptr(), swap, _Sp_counted_base release, etc. all embed __future_base in args).
+race:std::__future_base::_State_baseV2
+race:std::promise
+race:*__future_base*
+race:*_Sp_counted_base*
+
+# stdexec type-erased sender/scheduler storage (stdexec memory-model-correct, TSAN blind).
+# Glob forms are required because TSAN matches against the full demangled name including
+# all template arguments (e.g. exec::__any::__immovable_storage<vtable, alloc, 48ul, ...>::__t).
+race:exec::__any::__immovable_storage
+race:exec::__any::__rec::__ref
+race:exec::__any::__storage
+race:*exec::__any*
+
+# stdexec stop-token (inplace_stop_source/token/callback — memory-model-correct, TSAN blind).
+# Glob form covers _Optional_payload_base<inplace_stop_callback<...>> and
+# __atomic_base<unsigned char>::load() triggered by inplace_stop_source destructor.
+race:stdexec::inplace_stop
+race:*inplace_stop*
+
+# spdlog / fmtlib log buffer (iomgr synchronizes log-path, TSAN cannot track it).
+# basic_memory_buffer and detail::buffer<char>::append are both spdlog formatting paths.
+race:fmt::v12::basic_memory_buffer
+race:*fmt::v12*
+
+# std::basic_string races inside spdlog formatting (same root cause as fmt races above).
+race:*basic_string*
+
+# sisl metrics global registry (sisl's registry mutex is not visible to TSAN)
+race:homeblocks::VolumeMetrics::VolumeMetrics
+
+# iomgr run_on_forget / _run_forget — lambda alloc vs free races across reactor handoff;
+# iomgr synchronizes the lifetime but the coroutine + reactor boundary is TSAN-opaque.
+# operator new/delete appear at frame #0 when the lambda object straddles reactor handoff.
+race:run_on_forget
+race:iomgr::IOManager::_run_forget
+race:*tsan_new_delete*
+race:*_Function_base*
+
+# iomgr file-descriptor reuse across test restarts: TSAN tracks fd numbers as a single
+# resource across their lifetime.  When fd N is closed in test 1 and the OS recycles N
+# for a different device in test 2, TSAN conflates the two.  iomgr joins all threads
+# before restarting (confirmed by "All IO threads have stopped" in the logs), so there
+# is no concurrent access — just fd-number aliasing between separate test cases.
+race:iomgr::IODevice::close
+race:iomgr::IOReactorEPoll::remove_iodev_impl
+
+# homestore BtreeNode concurrent access — node-level write lock is homestore-internal
+# and invisible to TSAN; no homeblocks lock involved
+race:homestore::BtreeNode
+
+# homestore log group / replication journal — homestore-internal async dispatch;
+# synchronization across log_group.cpp and common.cpp is TSAN-opaque
+race:homestore::LogGroup::add_record
+race:homestore::repl_req_ctx::create_journal_entry
+
+# homestore IndexTable node read — same btree locking invisibility as BtreeNode above
+race:homestore::IndexTable
+
+# stdexec exec::__task move / await_transform (memory-model-correct, TSAN blind)
+race:exec::__task::basic_task
+
+# stdexec run_loop scheduler storage construction (memory-model-correct, TSAN blind)
+race:stdexec::__loop::run_loop
