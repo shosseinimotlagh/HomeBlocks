@@ -48,7 +48,7 @@ class HomeBlocksConan(ConanFile):
 
     def build_requirements(self):
         self.test_requires("gtest/[^1.17]")
-        self.test_requires("ublkpp/[^0.32]@oss/dev")
+        self.test_requires("ublkpp/[^0.33]@oss/main")
 
     def requirements(self):
         self.requires("homestore/[^8.0]@oss/dev", transitive_headers=True)
