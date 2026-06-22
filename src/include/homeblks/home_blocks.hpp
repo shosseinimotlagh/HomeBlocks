@@ -76,12 +76,18 @@ ENUM(volume_state, uint32_t,
      DESTROYED,  // fully torn down
      READONLY);
 
+// Selects the replication backend for a volume.
+// SOLO   — existing solo ReplDev (raid1-style, data through RAFT log).
+// CRAFT  — new CraftReplDev (data via client broadcast; RAFT carries only sync-LSN and login entries).
+ENUM(replication_mode, uint8_t, SOLO = 1, CRAFT);
+
 struct volume_info {
     volume_id_t id;
     uint64_t size_bytes{0};
     uint64_t page_size{0}; // logical block size for this volume (a per-volume runtime setting)
     std::string name;
     uint64_t ordinal{0}; // internal: chunk-selector ordinal, assigned by homeblocks on create/recover
+    replication_mode repl_mode{replication_mode::SOLO};
 
     volume_info() = default;
     volume_info(const volume_info&) = delete;
@@ -90,7 +96,8 @@ struct volume_info {
             size_bytes(rhs.size_bytes),
             page_size(rhs.page_size),
             name(std::move(rhs.name)),
-            ordinal(rhs.ordinal) {}
+            ordinal(rhs.ordinal),
+            repl_mode(rhs.repl_mode) {}
     volume_info(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name) :
             id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)) {}
     volume_info(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name, uint64_t ord) :
@@ -101,8 +108,9 @@ struct volume_info {
     }
     auto operator==(volume_info const& rhs) const { return id == rhs.id; }
     std::string to_string() const {
-        return fmt::format("volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={}",
-                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal);
+        return fmt::format("volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={}",
+                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal,
+                           enum_name(repl_mode));
     }
 };
 
