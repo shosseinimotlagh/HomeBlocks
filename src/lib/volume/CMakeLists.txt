@@ -8,6 +8,7 @@ target_sources("${PROJECT_NAME}" PRIVATE
     volume.cpp
     volume_chunk_selector.cpp
     $<TARGET_OBJECTS:${PROJECT_NAME}_core>
+    $<TARGET_OBJECTS:${PROJECT_NAME}_craft>
 )
 
 target_link_libraries("${PROJECT_NAME}" PUBLIC
