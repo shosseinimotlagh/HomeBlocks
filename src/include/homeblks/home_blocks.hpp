@@ -77,9 +77,9 @@ ENUM(volume_state, uint32_t,
      READONLY);
 
 // Selects the replication backend for a volume.
-// SOLO   — existing solo ReplDev (raid1-style, data through RAFT log).
-// CRAFT  — new CraftReplDev (data via client broadcast; RAFT carries only sync-LSN and login entries).
-ENUM(replication_mode, uint8_t, SOLO = 1, CRAFT);
+// DISABLED  — existing ReplDev (raid1-style, data through RAFT log).
+// CRAFT     — new CraftReplDev (data via client broadcast; RAFT carries only sync-LSN and login entries).
+ENUM(replication_mode, uint8_t, DISABLED = 1, CRAFT);
 
 struct volume_info {
     volume_id_t id;
@@ -87,7 +87,7 @@ struct volume_info {
     uint64_t page_size{0}; // logical block size for this volume (a per-volume runtime setting)
     std::string name;
     uint64_t ordinal{0}; // internal: chunk-selector ordinal, assigned by homeblocks on create/recover
-    replication_mode repl_mode{replication_mode::SOLO};
+    replication_mode repl_mode{replication_mode::DISABLED};
 
     volume_info() = default;
     volume_info(const volume_info&) = delete;
