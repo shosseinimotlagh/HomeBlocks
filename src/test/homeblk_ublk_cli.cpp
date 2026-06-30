@@ -71,7 +71,7 @@ SISL_OPTION_GROUP(
 // appear here. homeblocks reads its tunables (data/index_chunk_size_mb) out of the homeblk_ublk group.
 // `ublkpp_tgt` is ublkpp's own target option group (nr_hw_queues, feature_zero_copy, ...) -- ublkpp_tgt::run
 // reads it, so it must be enabled and loaded here just as ublkpp's own example/ublkpp_disk.cpp does.
-#define ENABLED_OPTIONS logging, ublkpp_tgt, homeblk_ublk
+#define ENABLED_OPTIONS logging, ublkpp_tgt, homeblk_ublk, config
 
 SISL_OPTIONS_ENABLE(ENABLED_OPTIONS)
 
