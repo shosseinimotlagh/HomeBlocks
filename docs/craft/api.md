@@ -7,13 +7,16 @@ volume owns instead of a solo `repl_dev`. It exposes the following methods, whic
 All methods are async/coroutine-style (`async_result<T>` or `async_status`) matching the
 existing HomeBlocks convention.
 
+> **Canonical design:** the [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design)
+> wiki page is the source of truth; this file is the C++ API reference.
+
 ---
 
 ## Per-partition in-memory state
 
 ```cpp
 struct CraftPartitionState {
-    int64_t  commit_lsn       {-1};  // highest committed dLSN
+    int64_t  commit_lsn       {-1};  // contiguous committed prefix (== Synced)
     int64_t  last_append_lsn  {-1};  // highest appended dLSN (may be uncommitted)
     uint64_t client_token     {0};   // token from last successful InternalLogin
     uint64_t term             {0};   // current RAFT term
@@ -77,11 +80,14 @@ Does **not** apply data to the LBA index; that happens on `commit`.
 
 ```cpp
 async_result<sisl::sg_list>
-read(uint64_t term, int64_t min_commit_lsn, lba_t lba, lba_count_t len);
+read(uint64_t term, int64_t readLSN, lba_t lba, lba_count_t len);
 ```
 
-If `state.commit_lsn < min_commit_lsn`: commit inline up to `min_commit_lsn` before
-serving. Then read from the committed state machine (LBA index → block read).
+`readLSN` is the read horizon `H`. Returns the latest version ≤ `H` for the range: if the
+touched entry is only Appended, commit it first (**CommitAndRead**), then serve from the LBA
+index. The read never fetches from a peer; the client routes only to a replica that holds
+every write ≤ `H` overlapping the range (LBA-overlap eligibility, plus `Synced ≥ L`, the
+login dLSN).
 
 Rejects if `term != state.term`.
 
@@ -94,9 +100,10 @@ async_status
 commit(uint64_t term, int64_t lsn);
 ```
 
-Advance `commit_lsn` to `lsn`: apply all journal entries in `(current_commit, lsn]` to the
-state machine (update LBA index, finalize block map). After this call, LBAs covered by
-those entries are readable.
+Advance the contiguous commit watermark `commit_lsn` (≡ Synced) toward `lsn`, applying
+present journal entries and skipping Empty slots. Readability is per-write, not tied to this
+watermark: a read materializes the entries it touches on demand (CommitAndRead), so a higher
+LSN can be readable while a lower one is still a hole.
 
 ---
 
@@ -214,6 +221,6 @@ is superseded. `CraftConnector` is the new frontend; `ScstConnector` is removed.
 | Old API (removed) | CRAFT replacement |
 |---|---|
 | `async_write(vol, addr, sgs)` | `write(term, lsn, glsn, lba, len, data)` |
-| `async_read(vol, addr, sgs)` | `read(term, min_commit_lsn, lba, len)` |
+| `async_read(vol, addr, sgs)` | `read(term, readLSN, lba, len)` |
 | `async_unmap` (stub) | No equivalent in CRAFT v1 |
 | — | `login`, `commit`, `keep_alive`, `truncate`, `fetch_data`, `get_lsns`, `append` |

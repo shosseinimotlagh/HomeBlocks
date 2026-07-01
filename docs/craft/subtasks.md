@@ -2,6 +2,9 @@
 
 Epic: [SDSTOR-22382](https://jirap.corp.ebay.com/browse/SDSTOR-22382) — CRAFT Server-Side (HB + CraftConnector)
 
+> **Canonical design:** the [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design)
+> wiki page is the source of truth for the model; this file is the work breakdown.
+
 Two components:
 - **Component A**: HomeBlocks CRAFT API (`CraftReplDev` + supporting internals)
 - **Component B**: `CraftConnector` (RPC frontend, analogous to `ScstConnector`)
@@ -20,7 +23,8 @@ S1 (CraftReplDev foundation)
 │       └── S7 (Login orchestration)  ← also needs S2, S4
 └── S8 (CRAFT volume lifecycle)
 
-S9 (CraftConnector)  ← skeleton early, full handlers need S2/S3/S7
+S9  (CraftConnector)  ← skeleton early, full handlers need S2/S3/S7
+S10 (Reconfiguration / membership change)  ← needs S5, S6, S8
 ```
 
 Parallel tracks after S1 completes: S2+S3, S4, S6+S5+S7, S8, S9-skeleton.
@@ -76,15 +80,17 @@ independently journal writes broadcast by the client.
 **Blocks:** S7, S9 (full)
 
 As an I/O engineer, I want `CraftReplDev::commit()`, `keep_alive()`, and `read()` so that
-clients can make writes readable and serve reads with inline commit guarantees.
+clients can make writes readable and serve reads without the read path ever fetching from a
+peer. See the CRAFT Design wiki page for the model.
 
 **Acceptance criteria:**
-- `commit(term, lsn)`: applies journal entries `(current_commit, lsn]` to the LBA index and block map; advances `commit_lsn`
+- `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced), applying present entries and skipping Empty slots. Readability is per-write.
 - `keep_alive(commit_lsn)`: same as commit + resets the client-timeout watchdog timer
-- `read(term, min_commit_lsn, lba, len)`: if `commit_lsn < min_commit_lsn`, commits inline first; then serves from the state machine via the existing `read_from_index` path
+- `read(term, readLSN, lba, len)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range; if the touched entry is only Appended, CommitAndRead (materialize it into the index) then serve. No peer fetch on the read path.
+- Read eligibility is enforced by the client (LBA-overlap against its per-replica Missing map, plus `Synced ≥ L`); a lagging member is never sent a read it cannot serve.
 - All three reject with `ETERM` if `term != state.term`
 - Watchdog timer: if no `keep_alive` or `write` arrives within configurable timeout, trigger `SyncRSCommitLSN` (see S5)
-- Unit tests cover: commit-then-read, inline commit on read, commit ordering, watchdog fire
+- Unit tests cover: commit-then-read, CommitAndRead on an appended entry, LBA-overlap routing (client picks an eligible replica), watchdog fire
 
 ---
 
@@ -161,7 +167,7 @@ term across the replica set.
 **Acceptance criteria:**
 - Implements the leader-side login sequence:
   1. Broadcast `GetRSCommitLSN` to all peers; collect `{commit_lsn, last_append_lsn}`
-  2. Compute `rs_commit_lsn` (quorum's max `last_append_lsn`, or `commit_lsn` if conservative)
+  2. Compute `rs_commit_lsn` = quorum's max `last_append_lsn` (forced; no `commit_lsn` variant, see the watermark deep-dive in the wiki)
   3. If `self.last_append_lsn < rs_commit_lsn`: `fetch_data(missing)` from ahead peer, append to own journal
   4. Propose `SyncRSCommitLSN(rs_commit_lsn)` via RAFT; wait for commit
   5. Propose `InternalLogin(client_token, term+1)` via RAFT; wait for commit
@@ -185,7 +191,7 @@ restarts without losing LSN state.
 - On `create_volume` with `craft` mode: create a multi-member RAFT group with the provided member endpoints
 - `vol_sb_t` persists `commit_lsn` and `last_append_lsn` (or they are recoverable from the journal on restart)
 - On `HomeBlocksImpl` restart: `CraftReplDev` recovers `{commit_lsn, last_append_lsn, term}` from the journal/superblock
-- Member add/remove stubs (for future membership changes)
+- Member add/remove stubs (the full reconfiguration path is S10)
 - Existing volume creation/removal lifecycle tests pass with CRAFT mode
 
 ---
@@ -207,6 +213,24 @@ the RPC layer and storage layer have a clean boundary with no storage logic in t
 - Term mismatch: return `ETERM` to client
 - Blocked on CRAFT-1 for the real transport; initial version uses direct function-call stubs
 - Integration test: end-to-end Login + Write + Read + Commit through the connector
+
+---
+
+## S10 — Reconfiguration (Membership Change)
+**Blocked by:** S5, S6, S8
+
+As an I/O engineer, I want CRAFT to add / replace / remove a replica-set member by leaning on
+HomeStore's `replace_member` machinery, so that the replica set can self-heal and rebalance
+without losing durability or read-safety. See the CRAFT Design wiki page for the design.
+
+**Acceptance criteria:**
+- Single-member-at-a-time changes; drive HomeStore `replace_member` (learner phase via `flip_learner_flag`); the listener implements `on_start_replace_member` / `on_complete_replace_member` / `on_clean_replace_member_task` / `on_remove_member`.
+- Snapshot callbacks (`create_snapshot` / `read_snapshot_obj` / `write_snapshot_obj` / `apply_snapshot`) ship CRAFT's committed index + blocks, sourced from a HomeStore CP boundary (`cp_mgr().trigger_cp_flush`), modeled on homeobject's `ReplicationStateMachine`.
+- Catch-up is pull-based: backlog via the snapshot path, tail via `SyncRSCommitLSN` -> `FetchData`.
+- Promotion (learner -> voter) gated by CRAFT's `commit_lsn ≥ startLSN` (carried in the keepalive response), interposed on `complete_replace_member`.
+- Detached recovery: a committed logout / lease record lets the RAFT leader self-elect to drive resync while no client is attached; it yields on the next committed `InternalLogin`.
+- Term-bump / re-login on `HS_CTRL_COMPLETE_REPLACE` so an attached client refreshes its member set.
+- Integration test (in-process, multiple `HomeBlkDisk` instances): replace a member, verify catch-up + promotion, no data loss, reads stay safe.
 
 ---
 

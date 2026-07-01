@@ -3,6 +3,9 @@
 8 RPCs total. 4 client↔server, 4 server↔server (2 via RAFT, 2 non-RAFT).
 RAFT internal RPCs (heartbeat, vote, membership) are not listed here.
 
+> **Canonical design:** the [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design)
+> wiki page is the source of truth; this file is the RPC wire-format reference.
+
 ---
 
 ## Client → Server
@@ -42,14 +45,17 @@ HomeBlocks handler: `CraftReplDev::write()`
 ### 3. Read (Unicast to chosen replica)
 
 ```
-Request:  { term: uint64, min_commit_lsn: int64, lba: uint64, len: uint32 }
+Request:  { term: uint64, readLSN: int64, lba: uint64, len: uint32 }
 Response: { status: Status, data: bytes }
 ```
 
-Client picks a replica whose Missing set does not overlap `[lba, lba+len)`. If
-`min_commit_lsn > replica.commit_lsn`, the replica commits inline first. For large
-reads crossing multiple LSNs where no single replica is up-to-date, the client splits
-the read across replicas.
+`readLSN` is the read horizon `H` (the client's contiguous quorum-acked prefix); the read
+reflects writes ≤ `H`. The client picks an *eligible* replica: one filled to the login dLSN
+`L` (`Synced ≥ L`) whose Missing set has no slot ≤ `H` overlapping `[lba, lba+len)`. The
+replica returns the latest version ≤ `H` for the range, committing the touched entry first
+if it is only appended (**CommitAndRead**). Because the client only routes to a servable
+replica, **the read path never fetches from a peer**; large multi-LBA reads may be split
+across replicas.
 
 HomeBlocks handler: `CraftReplDev::read()`
 
