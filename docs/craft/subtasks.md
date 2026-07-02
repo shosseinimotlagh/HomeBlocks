@@ -84,14 +84,15 @@ clients can make writes readable and serve reads without the read path ever fetc
 peer. See the CRAFT Design wiki page for the model.
 
 **Acceptance criteria:**
-- `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced), applying present entries and skipping Empty slots; **returns the achieved `{commit_lsn, last_append_lsn}`** (best-effort: `commit_lsn` stalls just below the first Missing hole, not an error). Readability is per-write.
-- `keep_alive(commit_lsn)`: same as commit + resets the client-timeout watchdog timer; **returns `{commit_lsn, last_append_lsn}`** (feeds the reconfig promotion gate)
-- `read(term, readLSN, lba, len)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range; if the touched entry is only Appended, CommitAndRead (materialize it into the index) then serve. No peer fetch on the read path.
-- **Recovery-aware:** on restart, rebuild the appended-above-`commit_lsn` set from the FUA-durable journal so a CommitAndRead'd entry survives a crash even if the index CP had not flushed; reads re-CommitAndRead as needed.
+- `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced) by applying present entries **strictly in dLSN order** (skipping Empty slots) and reclaiming superseded blocks; **returns the achieved `{commit_lsn, last_append_lsn}`** (best-effort: `commit_lsn` stalls just below the first Missing hole, not an error; only apply + reclaim pause, never reads). The index is never written out of order, so no per-entry version checks are needed and the index at any CP is an exact prefix.
+- `keep_alive(commit_lsn, all_committed_lsn)`: same as commit + resets the client-timeout watchdog timer; **returns `{commit_lsn, last_append_lsn}`** (feeds the reconfig promotion gate). `all_committed_lsn` (set-wide min, client-computed) lets the replica reclaim journal below `min(all_committed_lsn, checkpointed apply frontier)`.
+- `read(term, readLSN, lba, len)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range, from the index if applied or from the **journal-tail overlay** if only Appended (overlay read; **no index write on the read path**). No peer fetch on the read path.
+- **Journal-tail overlay:** in-memory map (LBA → highest-dLSN unapplied entry) over `(commit_lsn, last_append]`; consulted by reads, updated on append/apply/truncate.
+- **Recovery-aware:** on restart, rebuild the overlay (appended-above-`commit_lsn` set) from the FUA-durable journal (never reclaimed above the checkpointed frontier), so every appended entry is readable again after a crash.
 - Read eligibility is enforced by the client (LBA-overlap against its per-replica Missing map, plus `Synced ≥ L`); a lagging member is never sent a read it cannot serve.
 - All three reject with `ETERM` if `term != state.term`
 - Watchdog timer: if no `keep_alive` or `write` arrives within configurable timeout, trigger `SyncRSCommitLSN` (see S5)
-- Unit tests cover: commit-then-read, CommitAndRead on an appended entry, LBA-overlap routing (client picks an eligible replica), watchdog fire
+- Unit tests cover: commit-then-read, overlay read of an appended entry above a hole, in-order apply after the hole fills (same stable state as a no-hole run), overlay rebuild on restart, LBA-overlap routing (client picks an eligible replica), watchdog fire
 
 ---
 
@@ -124,10 +125,11 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 **Acceptance criteria:**
 
 **SyncRSCommitLSN:**
-- RAFT entry carries `{rs_commit_lsn, client_token}`
-- On apply: if `last_append_lsn < rs_commit_lsn`, **broadcast** `fetch_data()` for missing LSNs and accumulate, then set `commit_lsn = rs_commit_lsn`. **Apply never truncates** (above-watermark appends are the live tail); truncation is a login-only leader action
+- RAFT entry carries `{rs_commit_lsn, client_token, empty_slots[]}`
+- **Leader pre-resolution:** before proposing `N`, the leader resolves every unresolved slot ≤ `N`: fetch it from any holder, or record an `Empty` verdict on quorum-lacks evidence (leader counts itself; non-responders never count); it must not propose past an unresolved slot
+- On apply: verify token; mark `empty_slots` Empty, **discarding any local data held there** (reconciliation); if behind, `fetch_data()` the remaining missing slots from peers; then `commit_lsn = rs_commit_lsn`. **Apply never truncates** and replicas **never declare Empty unilaterally**
 - `append(sync_to, client_token)` proposes this entry via RAFT
-- Periodic auto-fire: every N LSNs (configurable via `home_blks_config.fbs`, default 128)
+- Triggers: periodic every N LSNs (configurable via `home_blks_config.fbs`, default 128), watchdog, login, **client-requested (after a failed sub-quorum write)**
 
 **InternalLogin:**
 - RAFT entry carries `{client_token, term}`
@@ -152,8 +154,8 @@ pull missing journal data during `SyncRSCommitLSN` apply.
 - `get_lsns(vol_id)` / `get_rs_commit_lsn()` returns `{commit_lsn, last_append_lsn}` for the local partition
 - `fetch_data(lsns)` reads raw journal data for the requested LSNs and returns it (without applying to state machine)
 - These are called server-to-server via `CraftConnector` (see S9); stub the transport for unit tests
-- `fetch_data` returns three-way per slot: present+data, **omitted** (not-present-here), or `is_empty=true` — the last **only** for a slot the peer has *positively* marked Empty in a prior resync, never for one it merely lacks
-- Declaring a slot `Empty` is a **quorum** decision by the lagging replica (broadcast + accumulate), not one peer's answer
+- `fetch_data` returns three-way per slot: present+data, **omitted** (not-present-here), or `is_empty=true` — the last **only** for a slot the peer has *positively* marked Empty (via a prior verdict), never for one it merely lacks
+- The `Empty` **verdict is leader-only** (S5 pre-resolution); `fetch_data` responders report state, they never decide
 - Unit tests cover: normal fetch, fetch across commit boundary, fetch of Empty slot
 
 ---
@@ -231,7 +233,8 @@ without losing durability or read-safety. See the CRAFT Design wiki page for the
 - Single-member-at-a-time changes; drive HomeStore `replace_member` (learner phase via `flip_learner_flag`); the listener implements `on_start_replace_member` / `on_complete_replace_member` / `on_clean_replace_member_task` / `on_remove_member`.
 - Snapshot callbacks (`create_snapshot` / `read_snapshot_obj` / `write_snapshot_obj` / `apply_snapshot`) ship CRAFT's committed index + blocks, sourced from a HomeStore CP boundary (`cp_mgr().trigger_cp_flush`), modeled on homeobject's `ReplicationStateMachine`.
 - Catch-up is pull-based: backlog via the snapshot path, tail via `SyncRSCommitLSN` -> `FetchData`.
-- Promotion (learner -> voter) gated by CRAFT's `commit_lsn ≥ startLSN` (carried in the keepalive response), interposed on `complete_replace_member`.
+- Promotion (learner -> voter) gated by CRAFT's `commit_lsn ≥ startLSN` (carried in the keep_alive response), interposed on `complete_replace_member`.
+- No removal fence: the live tail across removal is covered by broadcast + at-least-one-surviving-holder + server-side resync; tail loss requires a dual failure (see the wiki's Reconfiguration live-tail note).
 - Detached recovery: a committed logout / lease record lets the RAFT leader self-elect to drive resync while no client is attached; it yields on the next committed `InternalLogin`.
 - Term-bump / re-login on `HS_CTRL_COMPLETE_REPLACE` so an attached client refreshes its member set.
 - Integration test (in-process, multiple `HomeBlkDisk` instances): replace a member, verify catch-up + promotion, no data loss, reads stay safe.

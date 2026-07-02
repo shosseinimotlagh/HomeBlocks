@@ -55,8 +55,9 @@ Response: { status: Status, data: bytes }
 `readLSN` is the read horizon `H` (the client's contiguous quorum-acked prefix); the read
 reflects writes ≤ `H`. The client picks an *eligible* replica: one filled to the login dLSN
 `L` (`Synced ≥ L`) whose Missing set has no slot ≤ `H` overlapping `[lba, lba+len)`. The
-replica returns the latest version ≤ `H` for the range, committing the touched entry first
-if it is only appended (**CommitAndRead**). Because the client only routes to a servable
+replica returns the latest version ≤ `H` for the range, from the LBA index if applied or
+straight from the journal-tail overlay if only appended (an **overlay read**; no index write
+on the read path). Because the client only routes to a servable
 replica, **the read path never fetches from a peer**; large multi-LBA reads may be split
 across replicas.
 
@@ -82,13 +83,15 @@ HomeBlocks handler: `CraftReplDev::commit()`
 ### 5. KeepAlive (Broadcast to all replicas)
 
 ```
-Request:  { commit_lsn: int64 }
+Request:  { commit_lsn: int64, all_committed_lsn: int64 }
 Response: { status: Status, commit_lsn: int64, last_append_lsn: int64 }
 ```
 
-Advances `commit_lsn` and resets the per-replica client-timeout watchdog. The response
-carries `{commit_lsn, last_append_lsn}` (feeds the reconfig promotion gate). Sent
-periodically during idle periods and after every quorum-acknowledged write.
+Advances `commit_lsn` (in-order apply) and resets the per-replica client-timeout watchdog.
+The response carries `{commit_lsn, last_append_lsn}` (feeds the client's Missing map and the
+reconfig promotion gate); the request carries `all_committed_lsn`, the set-wide min the
+client computed from those responses, letting each replica reclaim journal opportunistically
+below it. Sent periodically during idle periods and after every quorum-acknowledged write.
 
 HomeBlocks handler: `CraftReplDev::keep_alive()`
 
@@ -124,9 +127,12 @@ Called when a replica discovers it is missing data for certain LSNs after receiv
 `SyncRSCommitLSN` RAFT entry. **Three-way per slot:** an entry with `is_empty=false` carries
 `data`; `is_empty=true` means the peer has **positively** marked that slot `Empty` in a prior
 resync; a requested `lsn` **omitted** from `slots` means *not-present-here*. A peer never
-returns `is_empty=true` for a slot it merely lacks. The lagging replica **broadcasts** to all
-peers and accumulates: it declares a slot `Empty` only when a **quorum** reports
-not-present / known-Empty (see the wiki's Resync section).
+returns `is_empty=true` for a slot it merely lacks. The `Empty` **verdict itself is
+leader-only**: the leader runs the broadcast-and-accumulate quorum procedure (itself
+included; non-responders never count) before proposing `SyncRSCommitLSN`, and distributes
+verdicts in that entry (`empty_slots[]`). Lagging replicas fetch present slots and obey the
+verdict list; they never declare `Empty` unilaterally (see the wiki's Resync section for the
+intersection argument and the Empty-beats-held-data reconciliation rule).
 
 HomeBlocks handler: `CraftReplDev::fetch_data()`
 Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
@@ -138,12 +144,18 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 ### 8. SyncRSCommitLSN (RAFT proposal, from leader)
 
 ```
-RAFT entry payload: { rs_commit_lsn: int64, client_token: uint64 }
+RAFT entry payload: { rs_commit_lsn: int64, client_token: uint64, empty_slots: [int64] }
 ```
 
-Proposed by the leader via `CraftReplDev::append()`. On RAFT commit each replica
-applies the entry: fetch missing data if behind, then advance `commit_lsn`. This is the
-primary recovery mechanism — it does not carry data itself, only the LSN watermark.
+Proposed by the leader via `CraftReplDev::append()`. **Before proposing**, the leader
+resolves every unresolved slot ≤ `rs_commit_lsn`: fetch it from any holder, or record an
+`Empty` verdict on quorum-lacks evidence; it never proposes past an unresolved slot. On
+RAFT commit each replica applies the entry: verify the token against the current session,
+mark `empty_slots` as permanent no-op holes (discarding any local data in them), fetch the
+remaining missing slots from peers (the leader is guaranteed to hold every non-Empty slot ≤
+the watermark), then advance `commit_lsn`. Replicas never declare `Empty` unilaterally.
+This is the primary recovery mechanism — it carries no write data, only the watermark and
+verdicts.
 
 ---
 

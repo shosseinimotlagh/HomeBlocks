@@ -101,18 +101,21 @@ public:
                        lba_t lba, lba_count_t len, sisl::sg_list data);
 
     // read_lsn is the horizon H: serve the latest version <= H for the range,
-    // committing the touched entry first if it is only Appended (CommitAndRead).
-    // Never fetches from a peer.
+    // from the LBA index if applied or from the journal-tail overlay if only
+    // Appended (no index write on the read path). Never fetches from a peer.
     async_result< sisl::sg_list > read(uint64_t term, int64_t read_lsn,
                                        lba_t lba, lba_count_t len);
 
-    // Advance the contiguous commit watermark toward lsn (apply present entries,
-    // skip Empty). Best-effort: stalls below the first Missing hole. Returns the
-    // achieved {commit_lsn, last_append_lsn}.
+    // Advance the contiguous commit watermark toward lsn: apply present entries
+    // strictly in dLSN order (skip Empty), reclaim superseded blocks. Best-effort:
+    // stalls below the first Missing hole (pauses apply/reclaim only, never
+    // reads). Returns the achieved {commit_lsn, last_append_lsn}.
     async_result< LSNPair > commit(uint64_t term, int64_t lsn);
 
-    // Same as commit + reset the client-timeout watchdog.
-    async_result< LSNPair > keep_alive(int64_t commit_lsn);
+    // Same as commit + reset the client-timeout watchdog. all_committed_lsn is
+    // the client-computed set-wide min commit_lsn; journal may be reclaimed below
+    // min(all_committed_lsn, checkpointed apply frontier).
+    async_result< LSNPair > keep_alive(int64_t commit_lsn, int64_t all_committed_lsn);
 
     // ── internal / peer API ────────────────────────────────────────────────
 

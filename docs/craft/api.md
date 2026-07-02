@@ -82,11 +82,11 @@ async_result<sisl::sg_list>
 read(uint64_t term, int64_t readLSN, lba_t lba, lba_count_t len);
 ```
 
-`readLSN` is the read horizon `H`. Returns the latest version ≤ `H` for the range: if the
-touched entry is only Appended, commit it first (**CommitAndRead**), then serve from the LBA
-index. The read never fetches from a peer; the client routes only to a replica that holds
-every write ≤ `H` overlapping the range (LBA-overlap eligibility, plus `Synced ≥ L`, the
-login dLSN).
+`readLSN` is the read horizon `H`. Returns the latest version ≤ `H` for the range: from the
+LBA index if applied, or straight from the **journal-tail overlay** if only Appended (an
+**overlay read**; no index write happens on the read path). The read never fetches from a
+peer; the client routes only to a replica that holds every write ≤ `H` overlapping the range
+(LBA-overlap eligibility, plus `Synced ≥ L`, the login dLSN).
 
 Rejects if `term != state.term`.
 
@@ -100,11 +100,12 @@ commit(uint64_t term, int64_t lsn);
 ```
 
 Advance the contiguous commit watermark `commit_lsn` (≡ Synced) toward `lsn`, applying
-present journal entries and skipping Empty slots. Returns the **achieved**
-`{commit_lsn, last_append_lsn}`: **best-effort**, `commit_lsn` stalls just below the first
-Missing hole (resync fills it), which is not an error. Readability is per-write, not tied to
-this watermark: a read materializes the entries it touches on demand (CommitAndRead), so a
-higher LSN can be readable while a lower one is still a hole.
+present journal entries **strictly in dLSN order** (skipping Empty slots) and reclaiming
+superseded blocks. Returns the **achieved** `{commit_lsn, last_append_lsn}`: **best-effort**,
+`commit_lsn` stalls just below the first Missing hole (resync fills it), which is not an
+error and pauses only apply + reclaim, never reads. Readability is per-write and does not
+wait for this watermark: appended entries above it are served from the journal-tail overlay,
+so a higher LSN can be readable while a lower one is still a hole.
 
 ---
 
@@ -112,13 +113,15 @@ higher LSN can be readable while a lower one is still a hole.
 
 ```cpp
 async_result<LSNPair>
-keep_alive(int64_t commit_lsn);
+keep_alive(int64_t commit_lsn, int64_t all_committed_lsn);
 ```
 
 Same as `commit` plus resets the client-timeout watchdog. Returns the replica's
 `{commit_lsn, last_append_lsn}` so the client can track the replica-set watermark (this feeds
-the reconfig promotion gate, `commit_lsn ≥ startLSN`). Sent periodically by the client even
-during idle periods to prevent the server from triggering `SyncRSCommitLSN`.
+the reconfig promotion gate, `commit_lsn ≥ startLSN`). `all_committed_lsn` is the set-wide
+min the client computed from those responses; the replica may reclaim journal below
+`min(all_committed_lsn, its checkpointed apply frontier)`. Sent periodically by the client
+even during idle periods to prevent the server from triggering `SyncRSCommitLSN`.
 
 ---
 
@@ -160,8 +163,11 @@ append(int64_t sync_to, uint64_t client_token);
 ```
 
 Proposes a `SyncRSCommitLSN` RAFT entry with value `sync_to`. Callable by the leader's
-watchdog or by the client-facing `SyncRSCommitLSN` RPC. `client_token` is embedded so
-followers can verify the entry belongs to the current session.
+watchdog, the periodic checkpoint, or a client request (e.g. after a failed sub-quorum
+write). The leader first resolves every unresolved slot ≤ `sync_to` (fetch from a holder,
+or an `Empty` verdict on quorum-lacks evidence) and attaches the `empty_slots[]` verdict
+list; it never proposes past an unresolved slot. `client_token` is embedded so followers
+can verify the entry belongs to the current session.
 
 ---
 
@@ -195,12 +201,16 @@ These are internal RAFT log entry types, not part of the public API.
 ### `SyncRSCommitLSN`
 
 ```
-payload: { rs_commit_lsn: int64 }
+payload: { rs_commit_lsn: int64, client_token: uint64, empty_slots: [int64] }
 ```
 
 On RAFT apply (each replica):
-1. If `last_append_lsn < rs_commit_lsn`: call `fetch_data(missing)` from a peer.
-2. `commit_lsn = rs_commit_lsn`.
+1. Verify `client_token` against the current session (stale-session entries are no-ops).
+2. Mark every slot in `empty_slots` as `Empty`, discarding any local data held there
+   (reconciliation).
+3. If `last_append_lsn < rs_commit_lsn`: `fetch_data(missing non-Empty slots)` from peers
+   (the leader holds every non-Empty slot ≤ the watermark).
+4. `commit_lsn = rs_commit_lsn`.
 
 ### `InternalLogin`
 

@@ -28,8 +28,8 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | **CRAFT** | Client Assisted RAFT — the HomeBlocks replication protocol |
 | **dLSN** | Data LSN — a monotonically increasing sequence number in the **data journal** of a single partition/replica-set. Dense (contiguous) per partition; the only LSN CRAFT itself uses. |
 | **rLSN** | RAFT LSN — the index within the RAFT log. Distinct from dLSN. |
-| **term** | RAFT term number, incremented on every new client login. Used by replicas to reject stale IOs. |
-| **commit_lsn (≡ Synced)** | The contiguous committed prefix: every dLSN ≤ it is applied to the state machine and readable (Empty slots skipped). Readability is per-write, so higher writes can be materialized on demand (CommitAndRead). |
+| **term** | CRAFT session term stored via `InternalLogin` (distinct from RAFT's internal election term), incremented on every client login. Used by replicas to reject stale IOs. |
+| **commit_lsn (≡ Synced)** | The contiguous applied prefix: every dLSN ≤ it is applied to the LBA index, strictly in dLSN order (Empty slots skipped). Readability is per-write and not gated on it: appended entries above it are served from the journal-tail overlay. |
 | **last_append_lsn** | Highest dLSN whose data has been written to the data journal (possibly not yet committed). |
 | **Replica Set (RS)** | The set of HomeBlocks nodes that hold copies of one partition. Typically 3 nodes. |
 | **Partition** | The independent replica-set CRAFT replicates. A volume comprises one or more partitions; a given LBA maps to exactly one partition. |
@@ -44,7 +44,7 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 
 - **Single writer**: only one client at a time owns a partition (enforced by `InternalLogin` RAFT entry).
 - **Leaderless data path**: after login, the RAFT leader has no special role for writes or reads.
-- **Client drives commit**: replicas do not commit until told (via `commit` / `keep_alive`). Readability is per-write: a read materializes the entries it touches (CommitAndRead).
+- **Client drives commit**: replicas apply to the index only when told (via `commit` / `keep_alive`), strictly in dLSN order at the contiguous frontier. Readability is per-write and does not wait: appended entries are served from the journal-tail overlay (no index write on the read path).
 - **Client-routed reads**: reads are unicast, chosen by LBA-overlap against the client's per-replica Missing map (plus `Synced ≥ L`, the login dLSN). The read path never fetches from a peer; fetch is resync-only.
 - **Merge key, not serialization**: overlapping writes need no ordering; highest dLSN per LBA wins on every replica.
 - **Reconfiguration leans on HomeStore**: `replace_member` / learner / snapshot / CP (see the wiki and subtasks S10).

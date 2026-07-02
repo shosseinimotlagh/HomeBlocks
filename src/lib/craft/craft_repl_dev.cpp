@@ -60,7 +60,8 @@ async_result< LSNPair > CraftReplDev::commit(uint64_t /* term */, int64_t /* lsn
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_result< LSNPair > CraftReplDev::keep_alive(int64_t /* commit_lsn */) {
+async_result< LSNPair > CraftReplDev::keep_alive(int64_t /* commit_lsn */,
+                                                  int64_t /* all_committed_lsn */) {
     LOGW("CraftReplDev::keep_alive not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
