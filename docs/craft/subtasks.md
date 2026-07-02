@@ -65,7 +65,8 @@ the HomeStore data journal (zero-copy, out-of-order tolerant), so that replicas 
 independently journal writes broadcast by the client.
 
 **Acceptance criteria:**
-- `write(term, lsn, lba, len, data)` appends to the journal at the given `lsn` slot
+- `write(term, lsn, lba, len, data)`: allocate blks up front, write the payload **once** via the data service (zero-copy), then journal the reference record `{term, lsn, lba, len, blkid}` at the `lsn` slot; ACK on journal-append completion (homestore's `HS_DATA_LINKED` pattern; the journal entry is header + key + serialized blkids only, payload never enters the journal)
+- Truncate (S4) and Empty-discard free the referenced blks; a crash between the data write and the journal append leaves only uncommitted blks, which homestore recovery reclaims
 - Rejects with `ETERM` if `term != state.term`
 - Updates `last_append_lsn = max(last_append_lsn, lsn)`
 - Handles out-of-order LSN arrival without blocking (gaps tracked as Missing); backed by the HomeStore logstore in **out-of-order mode** (`write_async(seq_num)`), not the append-only mode RAFT uses
@@ -87,6 +88,7 @@ peer. See the CRAFT Design wiki page for the model.
 - `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced) by applying present entries **strictly in dLSN order** (skipping Empty slots) and reclaiming superseded blocks; **returns the achieved `{commit_lsn, last_append_lsn}`** (best-effort: `commit_lsn` stalls just below the first Missing hole, not an error; only apply + reclaim pause, never reads). The index is never written out of order, so no per-entry version checks are needed and the index at any CP is an exact prefix.
 - `keep_alive(commit_lsn, all_committed_lsn)`: same as commit + resets the client-timeout watchdog timer; **returns `{commit_lsn, last_append_lsn}`** (feeds the reconfig promotion gate). `all_committed_lsn` (set-wide min, client-computed) lets the replica reclaim journal below `min(all_committed_lsn, checkpointed apply frontier)`.
 - `read(term, readLSN, lba, len)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range, from the index if applied or from the **journal-tail overlay** if only Appended (overlay read; **no index write on the read path**). No peer fetch on the read path.
+- **Server-side horizon clamp:** the replica serves only versions ≤ `readLSN`; a sub-quorum tail write above it (held in the overlay) is never returned. Unit test: with a locally-held write at LSN X, a read at `readLSN < X` returns the ≤`readLSN` version, not the held one.
 - **Journal-tail overlay:** in-memory map (LBA → highest-dLSN unapplied entry) over `(commit_lsn, last_append]`; consulted by reads, updated on append/apply/truncate.
 - **Recovery-aware:** on restart, rebuild the overlay (appended-above-`commit_lsn` set) from the FUA-durable journal (never reclaimed above the checkpointed frontier), so every appended entry is readable again after a crash.
 - Read eligibility is enforced by the client (LBA-overlap against its per-replica Missing map, plus `Synced ≥ L`); a lagging member is never sent a read it cannot serve.
@@ -197,6 +199,8 @@ restarts without losing LSN state.
 - On `create_volume` with `craft` mode: create a multi-member RAFT group with the provided member endpoints
 - `vol_sb_t` persists `commit_lsn` and `last_append_lsn` (or they are recoverable from the journal on restart)
 - On `HomeBlocksImpl` restart: `CraftReplDev` recovers `{commit_lsn, last_append_lsn, term}` from the journal/superblock
+- Journal reclaim: truncate the data journal below `min(checkpointed apply frontier, all_committed_lsn)` (see the wiki's journal-backing note)
+- RAFT-log compaction tied to the reclaim floor (compact below the `SyncRSCommitLSN` entry at the floor), so a member that fell past the retention window is RAFT-log-behind and nuraft's snapshot machinery (S10 callbacks) catches it up — returning voters as well as joiners; no separate trigger
 - Member add/remove stubs (the full reconfiguration path is S10)
 - Existing volume creation/removal lifecycle tests pass with CRAFT mode
 

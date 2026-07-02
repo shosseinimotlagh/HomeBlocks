@@ -57,7 +57,9 @@ reflects writes ≤ `H`. The client picks an *eligible* replica: one filled to t
 `L` (`Synced ≥ L`) whose Missing set has no slot ≤ `H` overlapping `[lba, lba+len)`. The
 replica returns the latest version ≤ `H` for the range, from the LBA index if applied or
 straight from the journal-tail overlay if only appended (an **overlay read**; no index write
-on the read path). Because the client only routes to a servable
+on the read path). A replica **ignores any write above `H` even if it holds it** (the
+sub-quorum tail), which is the server-side half of read safety. Because the client only routes
+to a servable
 replica, **the read path never fetches from a peer**; large multi-LBA reads may be split
 across replicas.
 
@@ -110,6 +112,9 @@ Leader sends to all peers to collect their current LSN state before a `SyncRSCom
 RAFT proposal. Used during login and on timeout. `is_login=true` (the login poll) makes the
 peer **quiesce prior-session writes** before reporting `last_append` (the fencing barrier);
 watchdog / periodic polls carry `is_login=false` and never quiesce (they ride the live tail).
+Only `last_append_lsn` feeds the recovery watermark; `commit_lsn` is a contiguity
+certificate that bounds the leader's hole-resolution window, seeds `all_committed_lsn`
+(journal reclaim) when no client is attached, and carries the reconfig promotion gate.
 
 HomeBlocks handler: `CraftReplDev::get_rs_commit_lsn()` / `get_lsns()`
 Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)

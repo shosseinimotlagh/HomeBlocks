@@ -63,13 +63,15 @@ write(uint64_t term, int64_t lsn,
       lba_t lba, lba_count_t len, sisl::sg_list data);
 ```
 
-Appends `data` to the data journal at slot `lsn`. Zero-copy required on the hot path.
+Lands `data` once and journals a reference at slot `lsn`. Zero-copy required on the hot path.
 
 Steps:
 1. Reject if `term != state.term` → `ETERM`.
-2. Write `data` to the journal at position `lsn` (may be out of order).
+2. Allocate blks, write `data` **once** via the data service (zero-copy), then append the
+   reference record `{term, lsn, lba, len, blkid}` to the journal at slot `lsn` (may be out
+   of order; homestore's `HS_DATA_LINKED` pattern).
 3. `state.last_append_lsn = max(state.last_append_lsn, lsn)`.
-4. ACK.
+4. ACK (on journal-append completion, which starts only after the data write completes).
 
 Does **not** apply data to the LBA index; that happens on `commit`.
 
@@ -84,7 +86,9 @@ read(uint64_t term, int64_t readLSN, lba_t lba, lba_count_t len);
 
 `readLSN` is the read horizon `H`. Returns the latest version ≤ `H` for the range: from the
 LBA index if applied, or straight from the **journal-tail overlay** if only Appended (an
-**overlay read**; no index write happens on the read path). The read never fetches from a
+**overlay read**; no index write happens on the read path). **Entries above `H` are never
+served even if the replica holds them** (the sub-quorum tail) — the server-side half of read
+safety. The read never fetches from a
 peer; the client routes only to a replica that holds every write ≤ `H` overlapping the range
 (LBA-overlap eligibility, plus `Synced ≥ L`, the login dLSN).
 
