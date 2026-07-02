@@ -174,7 +174,7 @@ term across the replica set.
   4. Propose `SyncRSCommitLSN(rs_commit_lsn)` via RAFT; wait for commit
   5. Propose `InternalLogin(client_token, term+1)` via RAFT; wait for commit
   6. Replicas with `last_append > rs_commit_lsn` receive `truncate(rs_commit_lsn)` call
-  7. Return `{members, dLSN=rs_commit_lsn, term=term+1}` (no `gLSN`; it is a volume-level LSN handled above CRAFT, out of scope)
+  7. Return `{members, dLSN=rs_commit_lsn, term=term+1}`
 - **Quiesce release:** if the login aborts (cannot reach quorum) the leader signals release, and replicas also time out the quiesce independently as a backstop, so a failed login cannot wedge the current owner
 - **Phase-1b fallback:** a slot ≤ `rs_commit_lsn` absent from the whole responding quorum was never quorum-durable and is marked `Empty`; if quorum is unreachable the login fails and the client retries
 - Returns `ENOTLEADER` if called on a follower

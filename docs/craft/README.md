@@ -27,7 +27,6 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 |---|---|
 | **CRAFT** | Client Assisted RAFT — the HomeBlocks replication protocol |
 | **dLSN** | Data LSN — a monotonically increasing sequence number in the **data journal** of a single partition/replica-set. Dense (contiguous) per partition; the only LSN CRAFT itself uses. |
-| **gLSN** | Global (volume-level) LSN — handled above CRAFT and out of scope here; CRAFT carries only the per-partition dLSN. |
 | **rLSN** | RAFT LSN — the index within the RAFT log. Distinct from dLSN. |
 | **term** | RAFT term number, incremented on every new client login. Used by replicas to reject stale IOs. |
 | **commit_lsn (≡ Synced)** | The contiguous committed prefix: every dLSN ≤ it is applied to the state machine and readable (Empty slots skipped). Readability is per-write, so higher writes can be materialized on demand (CommitAndRead). |

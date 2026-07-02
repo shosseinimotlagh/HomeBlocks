@@ -21,8 +21,8 @@ Client sends to the RAFT leader. Leader runs the full login orchestration sequen
 (GetRSCommitLSN → optional FetchData → SyncRSCommitLSN RAFT → InternalLogin RAFT)
 and responds once both RAFT entries commit.
 
-`client_token` is an opaque 64-bit identity token. `gLSN` is intentionally absent: it is a
-volume-level LSN handled above CRAFT (out of scope here); CRAFT carries only the per-partition `dLSN`.
+`client_token` is an opaque 64-bit identity token. `dLSN` is the per-partition LSN, the only
+LSN CRAFT carries.
 
 HomeBlocks handler: `CraftReplDev::login()`
 

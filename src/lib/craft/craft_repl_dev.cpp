@@ -41,7 +41,7 @@ async_result< LoginResult > CraftReplDev::login(uint64_t /* client_token */,
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_status CraftReplDev::write(uint64_t /* term */, int64_t /* lsn */, int64_t /* glsn */,
+async_status CraftReplDev::write(uint64_t /* term */, int64_t /* lsn */,
                                   lba_t /* lba */, lba_count_t /* len */,
                                   sisl::sg_list /* data */) {
     LOGW("CraftReplDev::write not yet implemented");

@@ -53,9 +53,6 @@ Leader-only. Orchestrates the full login sequence:
 **Postconditions:** all quorum members have `commit_lsn == rs_commit_lsn`; all reject IOs
 from any token other than `client_token`.
 
-> `gLSN` is intentionally absent from `LoginResult`: it is a volume-level LSN handled
-> above CRAFT and out of scope here. CRAFT speaks only the per-partition `dLSN`.
-
 ---
 
 ### `write`

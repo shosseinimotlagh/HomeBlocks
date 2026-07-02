@@ -51,7 +51,6 @@ struct LSNPair {
 struct LoginResult {
     std::vector< replica_endpoint > members;
     int64_t  dLSN; // starting LSN for new I/O
-    int64_t  gLSN; // global (volume-level) LSN
     uint64_t term;
 };
 
@@ -98,7 +97,7 @@ public:
 
     // Append data to the journal at the client-assigned LSN slot. Zero-copy;
     // does NOT apply data to the LBA index.
-    async_status write(uint64_t term, int64_t lsn, int64_t glsn,
+    async_status write(uint64_t term, int64_t lsn,
                        lba_t lba, lba_count_t len, sisl::sg_list data);
 
     // Inline-commit up to min_commit_lsn if needed, then serve from the LBA index.
