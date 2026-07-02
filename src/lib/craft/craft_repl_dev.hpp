@@ -100,15 +100,19 @@ public:
     async_status write(uint64_t term, int64_t lsn,
                        lba_t lba, lba_count_t len, sisl::sg_list data);
 
-    // Inline-commit up to min_commit_lsn if needed, then serve from the LBA index.
-    async_result< sisl::sg_list > read(uint64_t term, int64_t min_commit_lsn,
+    // read_lsn is the horizon H: serve the latest version <= H for the range,
+    // committing the touched entry first if it is only Appended (CommitAndRead).
+    // Never fetches from a peer.
+    async_result< sisl::sg_list > read(uint64_t term, int64_t read_lsn,
                                        lba_t lba, lba_count_t len);
 
-    // Apply journal entries (current_commit, lsn] to the LBA index.
-    async_status commit(uint64_t term, int64_t lsn);
+    // Advance the contiguous commit watermark toward lsn (apply present entries,
+    // skip Empty). Best-effort: stalls below the first Missing hole. Returns the
+    // achieved {commit_lsn, last_append_lsn}.
+    async_result< LSNPair > commit(uint64_t term, int64_t lsn);
 
     // Same as commit + reset the client-timeout watchdog.
-    async_status keep_alive(int64_t commit_lsn);
+    async_result< LSNPair > keep_alive(int64_t commit_lsn);
 
     // ── internal / peer API ────────────────────────────────────────────────
 

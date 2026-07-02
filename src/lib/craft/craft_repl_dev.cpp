@@ -49,18 +49,18 @@ async_status CraftReplDev::write(uint64_t /* term */, int64_t /* lsn */,
 }
 
 async_result< sisl::sg_list > CraftReplDev::read(uint64_t /* term */,
-                                                   int64_t /* min_commit_lsn */,
+                                                   int64_t /* read_lsn */,
                                                    lba_t /* lba */, lba_count_t /* len */) {
     LOGW("CraftReplDev::read not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_status CraftReplDev::commit(uint64_t /* term */, int64_t /* lsn */) {
+async_result< LSNPair > CraftReplDev::commit(uint64_t /* term */, int64_t /* lsn */) {
     LOGW("CraftReplDev::commit not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_status CraftReplDev::keep_alive(int64_t /* commit_lsn */) {
+async_result< LSNPair > CraftReplDev::keep_alive(int64_t /* commit_lsn */) {
     LOGW("CraftReplDev::keep_alive not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
