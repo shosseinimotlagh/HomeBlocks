@@ -26,14 +26,14 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | Term | Definition |
 |---|---|
 | **CRAFT** | Client Assisted RAFT — the HomeBlocks replication protocol |
-| **dLSN** | Data LSN — a monotonically increasing sequence number in the **data journal** of a single partition/replica-set. Per-volume in HomeBlocks (a volume maps to one partition). |
-| **gLSN** | Global LSN — monotonically increasing across all partitions of a volume. |
+| **dLSN** | Data LSN — a monotonically increasing sequence number in the **data journal** of a single partition/replica-set. Dense (contiguous) per partition; the only LSN CRAFT itself uses. |
+| **gLSN** | Global (volume-level) LSN — handled above CRAFT and out of scope here; CRAFT carries only the per-partition dLSN. |
 | **rLSN** | RAFT LSN — the index within the RAFT log. Distinct from dLSN. |
 | **term** | RAFT term number, incremented on every new client login. Used by replicas to reject stale IOs. |
 | **commit_lsn (≡ Synced)** | The contiguous committed prefix: every dLSN ≤ it is applied to the state machine and readable (Empty slots skipped). Readability is per-write, so higher writes can be materialized on demand (CommitAndRead). |
 | **last_append_lsn** | Highest dLSN whose data has been written to the data journal (possibly not yet committed). |
 | **Replica Set (RS)** | The set of HomeBlocks nodes that hold copies of one partition. Typically 3 nodes. |
-| **Partition** | A contiguous region of a Volume, replicated across one Replica Set. In HomeBlocks, partition ≈ volume. |
+| **Partition** | The independent replica-set CRAFT replicates. A volume comprises one or more partitions; a given LBA maps to exactly one partition. |
 | **CraftReplDev** | New HomeBlocks replication device class (parallel to `ReplDisk`) that implements CRAFT. |
 | **CraftConnector** | New HomeBlocks RPC frontend (parallel to `ScstConnector`) that translates NubloxProto RPCs to `CraftReplDev` API calls. |
 | **SyncRSCommitLSN** | A RAFT log entry type. On apply, each replica fetches any missing data up to the encoded dLSN and advances `commit_lsn`. |

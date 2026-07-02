@@ -65,10 +65,10 @@ the HomeStore data journal (zero-copy, out-of-order tolerant), so that replicas 
 independently journal writes broadcast by the client.
 
 **Acceptance criteria:**
-- `write(term, lsn, glsn, lba, len, data)` appends to the journal at the given `lsn` slot
+- `write(term, lsn, lba, len, data)` appends to the journal at the given `lsn` slot
 - Rejects with `ETERM` if `term != state.term`
 - Updates `last_append_lsn = max(last_append_lsn, lsn)`
-- Handles out-of-order LSN arrival without blocking (gaps tracked as Missing)
+- Handles out-of-order LSN arrival without blocking (gaps tracked as Missing); backed by the HomeStore logstore in **out-of-order mode** (`write_async(seq_num)`), not the append-only mode RAFT uses
 - Zero-copy: `data` buffer is not copied during the append path
 - Does NOT apply data to the LBA index (that is `commit`'s job)
 - Unit tests cover: in-order writes, out-of-order writes, term rejection
@@ -84,9 +84,10 @@ clients can make writes readable and serve reads without the read path ever fetc
 peer. See the CRAFT Design wiki page for the model.
 
 **Acceptance criteria:**
-- `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced), applying present entries and skipping Empty slots. Readability is per-write.
-- `keep_alive(commit_lsn)`: same as commit + resets the client-timeout watchdog timer
+- `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced), applying present entries and skipping Empty slots; **returns the achieved `{commit_lsn, last_append_lsn}`** (best-effort: `commit_lsn` stalls just below the first Missing hole, not an error). Readability is per-write.
+- `keep_alive(commit_lsn)`: same as commit + resets the client-timeout watchdog timer; **returns `{commit_lsn, last_append_lsn}`** (feeds the reconfig promotion gate)
 - `read(term, readLSN, lba, len)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range; if the touched entry is only Appended, CommitAndRead (materialize it into the index) then serve. No peer fetch on the read path.
+- **Recovery-aware:** on restart, rebuild the appended-above-`commit_lsn` set from the FUA-durable journal so a CommitAndRead'd entry survives a crash even if the index CP had not flushed; reads re-CommitAndRead as needed.
 - Read eligibility is enforced by the client (LBA-overlap against its per-replica Missing map, plus `Synced ≥ L`); a lagging member is never sent a read it cannot serve.
 - All three reject with `ETERM` if `term != state.term`
 - Watchdog timer: if no `keep_alive` or `write` arrives within configurable timeout, trigger `SyncRSCommitLSN` (see S5)
@@ -124,7 +125,7 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 
 **SyncRSCommitLSN:**
 - RAFT entry carries `{rs_commit_lsn, client_token}`
-- On apply: if `last_append_lsn < rs_commit_lsn`, call `fetch_data()` for missing LSNs from a peer; then set `commit_lsn = rs_commit_lsn`
+- On apply: if `last_append_lsn < rs_commit_lsn`, **broadcast** `fetch_data()` for missing LSNs and accumulate, then set `commit_lsn = rs_commit_lsn`. **Apply never truncates** (above-watermark appends are the live tail); truncation is a login-only leader action
 - `append(sync_to, client_token)` proposes this entry via RAFT
 - Periodic auto-fire: every N LSNs (configurable via `home_blks_config.fbs`, default 128)
 
@@ -151,7 +152,8 @@ pull missing journal data during `SyncRSCommitLSN` apply.
 - `get_lsns(vol_id)` / `get_rs_commit_lsn()` returns `{commit_lsn, last_append_lsn}` for the local partition
 - `fetch_data(lsns)` reads raw journal data for the requested LSNs and returns it (without applying to state machine)
 - These are called server-to-server via `CraftConnector` (see S9); stub the transport for unit tests
-- `fetch_data` must handle: LSNs that are committed, LSNs that are only appended, LSNs that are Empty (return a sentinel, not an error)
+- `fetch_data` returns three-way per slot: present+data, **omitted** (not-present-here), or `is_empty=true` — the last **only** for a slot the peer has *positively* marked Empty in a prior resync, never for one it merely lacks
+- Declaring a slot `Empty` is a **quorum** decision by the lagging replica (broadcast + accumulate), not one peer's answer
 - Unit tests cover: normal fetch, fetch across commit boundary, fetch of Empty slot
 
 ---
@@ -166,13 +168,15 @@ term across the replica set.
 
 **Acceptance criteria:**
 - Implements the leader-side login sequence:
-  1. Broadcast `GetRSCommitLSN` to all peers; collect `{commit_lsn, last_append_lsn}`
+  1. Broadcast `GetRSCommitLSN(is_login=true)` to all peers; each **quiesces prior-session writes** before replying (fencing barrier); collect `{commit_lsn, last_append_lsn}`
   2. Compute `rs_commit_lsn` = quorum's max `last_append_lsn` (forced; no `commit_lsn` variant, see the watermark deep-dive in the wiki)
   3. If `self.last_append_lsn < rs_commit_lsn`: `fetch_data(missing)` from ahead peer, append to own journal
   4. Propose `SyncRSCommitLSN(rs_commit_lsn)` via RAFT; wait for commit
   5. Propose `InternalLogin(client_token, term+1)` via RAFT; wait for commit
   6. Replicas with `last_append > rs_commit_lsn` receive `truncate(rs_commit_lsn)` call
-  7. Return `{members, dLSN=rs_commit_lsn, term=term+1, gLSN}`
+  7. Return `{members, dLSN=rs_commit_lsn, term=term+1}` (no `gLSN`; it is a volume-level LSN handled above CRAFT, out of scope)
+- **Quiesce release:** if the login aborts (cannot reach quorum) the leader signals release, and replicas also time out the quiesce independently as a backstop, so a failed login cannot wedge the current owner
+- **Phase-1b fallback:** a slot ≤ `rs_commit_lsn` absent from the whole responding quorum was never quorum-durable and is marked `Empty`; if quorum is unreachable the login fails and the client retries
 - Returns `ENOTLEADER` if called on a follower
 - Login is serialized (only one in-flight login per partition at a time)
 - Integration test: 3-node mock cluster; login with divergent replica state; verify all replicas converge

@@ -34,8 +34,7 @@ This state is authoritative in memory and recovered from the journal + superbloc
 ```cpp
 struct LoginResult {
     std::vector<replica_endpoint> members;
-    int64_t  dLSN;   // starting LSN for new IO
-    int64_t  gLSN;   // global (volume-level) LSN
+    int64_t  dLSN;   // starting (per-partition) LSN for new IO
     uint64_t term;
 };
 
@@ -54,13 +53,16 @@ Leader-only. Orchestrates the full login sequence:
 **Postconditions:** all quorum members have `commit_lsn == rs_commit_lsn`; all reject IOs
 from any token other than `client_token`.
 
+> `gLSN` is intentionally absent from `LoginResult`: it is a volume-level LSN handled
+> above CRAFT and out of scope here. CRAFT speaks only the per-partition `dLSN`.
+
 ---
 
 ### `write`
 
 ```cpp
 async_status
-write(uint64_t term, int64_t lsn, int64_t glsn,
+write(uint64_t term, int64_t lsn,
       lba_t lba, lba_count_t len, sisl::sg_list data);
 ```
 
@@ -96,26 +98,30 @@ Rejects if `term != state.term`.
 ### `commit`
 
 ```cpp
-async_status
+async_result<LSNPair>
 commit(uint64_t term, int64_t lsn);
 ```
 
 Advance the contiguous commit watermark `commit_lsn` (≡ Synced) toward `lsn`, applying
-present journal entries and skipping Empty slots. Readability is per-write, not tied to this
-watermark: a read materializes the entries it touches on demand (CommitAndRead), so a higher
-LSN can be readable while a lower one is still a hole.
+present journal entries and skipping Empty slots. Returns the **achieved**
+`{commit_lsn, last_append_lsn}`: **best-effort**, `commit_lsn` stalls just below the first
+Missing hole (resync fills it), which is not an error. Readability is per-write, not tied to
+this watermark: a read materializes the entries it touches on demand (CommitAndRead), so a
+higher LSN can be readable while a lower one is still a hole.
 
 ---
 
 ### `keep_alive`
 
 ```cpp
-async_status
+async_result<LSNPair>
 keep_alive(int64_t commit_lsn);
 ```
 
-Same as `commit` plus resets the client-timeout watchdog. Sent periodically by the client
-even during idle periods to prevent the server from triggering `SyncRSCommitLSN`.
+Same as `commit` plus resets the client-timeout watchdog. Returns the replica's
+`{commit_lsn, last_append_lsn}` so the client can track the replica-set watermark (this feeds
+the reconfig promotion gate, `commit_lsn ≥ startLSN`). Sent periodically by the client even
+during idle periods to prevent the server from triggering `SyncRSCommitLSN`.
 
 ---
 
@@ -220,7 +226,7 @@ is superseded. `CraftConnector` is the new frontend; `ScstConnector` is removed.
 
 | Old API (removed) | CRAFT replacement |
 |---|---|
-| `async_write(vol, addr, sgs)` | `write(term, lsn, glsn, lba, len, data)` |
+| `async_write(vol, addr, sgs)` | `write(term, lsn, lba, len, data)` |
 | `async_read(vol, addr, sgs)` | `read(term, readLSN, lba, len)` |
 | `async_unmap` (stub) | No equivalent in CRAFT v1 |
 | — | `login`, `commit`, `keep_alive`, `truncate`, `fetch_data`, `get_lsns`, `append` |
