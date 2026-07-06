@@ -71,8 +71,9 @@ independently journal writes broadcast by the client.
 - Updates `last_append_lsn = max(last_append_lsn, lsn)`
 - Handles out-of-order LSN arrival without blocking (gaps tracked as Missing); backed by the HomeStore logstore in **out-of-order mode** (`write_async(seq_num)`), not the append-only mode RAFT uses
 - Zero-copy: `data` buffer is not copied during the append path
-- Does NOT apply data to the LBA index (that is `commit`'s job)
-- Unit tests cover: in-order writes, out-of-order writes, term rejection
+- **Thin (`all_zeros`) write:** `write(term, lsn, lba, len, all_zeros, data)` with `all_zeros=true` (WRITE_ZEROES / discard-to-zero) skips allocation and the data-service write; journal a metadata-only slot `{term, lsn, lba, len, all_zeros}`. Both forms take a dLSN and merge by highest-per-LBA. The client sets `all_zeros` after a client-side zero scan; the server does **not** re-scan a data write
+- Does NOT apply data to the LBA index (that is `commit`'s job; a zero write applies as an index delete / range unmap)
+- Unit tests cover: in-order writes, out-of-order writes, term rejection, a zero (`all_zeros`) write allocates no blocks and merges over/under a data write by dLSN
 
 ---
 
@@ -85,16 +86,17 @@ clients can make writes readable and serve reads without the read path ever fetc
 peer. See the CRAFT Design wiki page for the model.
 
 **Acceptance criteria:**
-- `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced) by applying present entries **strictly in dLSN order** (skipping Empty slots) and reclaiming superseded blocks; **returns the achieved `{commit_lsn, last_append_lsn}`** (best-effort: `commit_lsn` stalls just below the first Missing hole, not an error; only apply + reclaim pause, never reads). The index is never written out of order, so no per-entry version checks are needed and the index at any CP is an exact prefix.
+- `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced) by applying present entries **strictly in dLSN order** (skipping Empty slots) and reclaiming superseded blocks (a data entry applies as an index insert; a zero `all_zeros` entry as an index delete / range unmap); **returns the achieved `{commit_lsn, last_append_lsn}`** (best-effort: `commit_lsn` stalls just below the first Missing hole, not an error; only apply + reclaim pause, never reads). The index is never written out of order, so no per-entry version checks are needed and the index at any CP is an exact prefix.
 - `keep_alive(commit_lsn, all_committed_lsn)`: same as commit + resets the client-timeout watchdog timer; **returns `{commit_lsn, last_append_lsn}`** (feeds the reconfig promotion gate). `all_committed_lsn` (set-wide min, client-computed) lets the replica reclaim journal below `min(all_committed_lsn, checkpointed apply frontier)`.
 - `read(term, readLSN, lba, len)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range, from the index if applied or from the **journal-tail overlay** if only Appended (overlay read; **no index write on the read path**). No peer fetch on the read path.
+- **Thin reads (sparse + holes):** the result is data extents interleaved with **holes** for sub-ranges with no data (never written, a committed `all_zeros` write, or an all-zero region collapsed by a read-time scan); a hole is a marker, never a materialized zero buffer, and is **not** `Missing`. The read-time scan is the only zero-scan on the server (the write path never re-scans).
 - **Server-side horizon clamp:** the replica serves only versions ≤ `readLSN`; a sub-quorum tail write above it (held in the overlay) is never returned. Unit test: with a locally-held write at LSN X, a read at `readLSN < X` returns the ≤`readLSN` version, not the held one.
 - **Journal-tail overlay:** in-memory map (LBA → highest-dLSN unapplied entry) over `(commit_lsn, last_append]`; consulted by reads, updated on append/apply/truncate.
 - **Recovery-aware:** on restart, rebuild the overlay (appended-above-`commit_lsn` set) from the FUA-durable journal (never reclaimed above the checkpointed frontier), so every appended entry is readable again after a crash.
 - Read eligibility is enforced by the client (LBA-overlap against its per-replica Missing map, plus `Synced ≥ L`); a lagging member is never sent a read it cannot serve.
 - All three reject with `ETERM` if `term != state.term`
 - Watchdog timer: if no `keep_alive` or `write` arrives within configurable timeout, trigger `SyncRSCommitLSN` (see S5)
-- Unit tests cover: commit-then-read, overlay read of an appended entry above a hole, in-order apply after the hole fills (same stable state as a no-hole run), overlay rebuild on restart, LBA-overlap routing (client picks an eligible replica), watchdog fire
+- Unit tests cover: commit-then-read, overlay read of an appended entry above a hole, in-order apply after the hole fills (same stable state as a no-hole run), overlay rebuild on restart, LBA-overlap routing (client picks an eligible replica), watchdog fire, a zero write reads back as a hole, a data write of all-zero bytes also reads back as a hole (read-time scan)
 
 ---
 
@@ -156,7 +158,7 @@ pull missing journal data during `SyncRSCommitLSN` apply.
 - `get_lsns(vol_id)` / `get_rs_commit_lsn()` returns `{commit_lsn, last_append_lsn}` for the local partition
 - `fetch_data(lsns)` reads raw journal data for the requested LSNs and returns it (without applying to state machine)
 - These are called server-to-server via `CraftConnector` (see S9); stub the transport for unit tests
-- `fetch_data` returns three-way per slot: present+data, **omitted** (not-present-here), or `is_empty=true` — the last **only** for a slot the peer has *positively* marked Empty (via a prior verdict), never for one it merely lacks
+- `fetch_data` returns four-way per slot: present+data, **present+zero** (`all_zeros=true`, no data, applied as a range unmap), **omitted** (not-present-here), or `is_empty=true` — the last **only** for a slot the peer has *positively* marked Empty (via a prior verdict), never for one it merely lacks
 - The `Empty` **verdict is leader-only** (S5 pre-resolution); `fetch_data` responders report state, they never decide
 - Unit tests cover: normal fetch, fetch across commit boundary, fetch of Empty slot
 

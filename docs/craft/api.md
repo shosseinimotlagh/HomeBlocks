@@ -8,7 +8,9 @@ All methods are async/coroutine-style (`async_result<T>` or `async_status`) matc
 existing HomeBlocks convention.
 
 > **Canonical design:** the [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design)
-> wiki page is the source of truth; this file is the C++ API reference.
+> wiki page is the source of truth for the protocol, and
+> [**CRAFT on HomeBlocks**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-on-HomeBlocks) for the
+> implementation binding; this file is the C++ API reference.
 
 ---
 
@@ -60,36 +62,45 @@ from any token other than `client_token`.
 ```cpp
 async_status
 write(uint64_t term, int64_t lsn,
-      lba_t lba, lba_count_t len, sisl::sg_list data);
+      lba_t lba, lba_count_t len, bool all_zeros, sisl::sg_list data);
 ```
 
-Lands `data` once and journals a reference at slot `lsn`. Zero-copy required on the hot path.
+Two forms, both journaled at slot `lsn` and both taking a `dLSN` that merges by
+highest-per-LBA. A **data write** (`all_zeros=false`) lands `data` once and journals a
+reference; zero-copy required on the hot path. A **zero write** (`all_zeros=true`, the
+WRITE_ZEROES / discard-to-zero op) carries no `data`: it allocates nothing and journals a
+metadata-only slot `{term, lsn, lba, len, all_zeros}`.
 
 Steps:
 1. Reject if `term != state.term` → `ETERM`.
-2. Allocate blks, write `data` **once** via the data service (zero-copy), then append the
-   reference record `{term, lsn, lba, len, blkid}` to the journal at slot `lsn` (may be out
-   of order; homestore's `HS_DATA_LINKED` pattern).
+2. Data write: allocate blks, write `data` **once** via the data service (zero-copy), then
+   append the reference record `{term, lsn, lba, len, blkid}` to the journal at slot `lsn` (may
+   be out of order; homestore's `HS_DATA_LINKED` pattern). Zero write: no allocation and no
+   data-service write; append the metadata-only record. The client sets `all_zeros` after a
+   client-side zero scan; the server does **not** re-scan a data write.
 3. `state.last_append_lsn = max(state.last_append_lsn, lsn)`.
 4. ACK (on journal-append completion, which starts only after the data write completes).
 
-Does **not** apply data to the LBA index; that happens on `commit`.
+Does **not** apply data to the LBA index; that happens on `commit` (a zero write applies as an
+index delete / range unmap).
 
 ---
 
 ### `read`
 
 ```cpp
-async_result<sisl::sg_list>
+async_result<ReadResult>   // sparse: data extents + holes
 read(uint64_t term, int64_t readLSN, lba_t lba, lba_count_t len);
 ```
 
-`readLSN` is the read horizon `H`. Returns the latest version ≤ `H` for the range: from the
-LBA index if applied, or straight from the **journal-tail overlay** if only Appended (an
-**overlay read**; no index write happens on the read path). **Entries above `H` are never
-served even if the replica holds them** (the sub-quorum tail) — the server-side half of read
-safety. The read never fetches from a
-peer; the client routes only to a replica that holds every write ≤ `H` overlapping the range
+`readLSN` is the read horizon `H`. Returns the latest version ≤ `H` for the range as a
+**sparse** result: data extents interleaved with **holes** for sub-ranges with no data (never
+written, zero-written, or an all-zero region collapsed by a read-time scan; the caller reads a
+hole as zeros, and a hole is not `Missing`). Data extents come from the LBA index if applied, or
+straight from the **journal-tail overlay** if only Appended (an **overlay read**; no index write
+happens on the read path). **Entries above `H` are never served even if the replica holds them**
+(the sub-quorum tail), the server-side half of read safety. The read never fetches from a peer;
+the client routes only to a replica that holds every write ≤ `H` overlapping the range
 (LBA-overlap eligibility, plus `Synced ≥ L`, the login dLSN).
 
 Rejects if `term != state.term`.
@@ -105,7 +116,9 @@ commit(uint64_t term, int64_t lsn);
 
 Advance the contiguous commit watermark `commit_lsn` (≡ Synced) toward `lsn`, applying
 present journal entries **strictly in dLSN order** (skipping Empty slots) and reclaiming
-superseded blocks. Returns the **achieved** `{commit_lsn, last_append_lsn}`: **best-effort**,
+superseded blocks (a data entry applies as an index insert; a zero `all_zeros` entry as an
+index delete / range unmap). Returns the **achieved** `{commit_lsn, last_append_lsn}`:
+**best-effort**,
 `commit_lsn` stalls just below the first Missing hole (resync fills it), which is not an
 error and pauses only apply + reclaim, never reads. Readability is per-write and does not
 wait for this watermark: appended entries above it are served from the journal-tail overlay,
@@ -183,7 +196,10 @@ fetch_data(std::vector<int64_t> lsns);
 ```
 
 Returns raw journal data for the requested LSNs. Called server-to-server (not from the
-client) during `SyncRSCommitLSN` apply when a replica discovers it is behind.
+client) during `SyncRSCommitLSN` apply when a replica discovers it is behind. Each `JournalSlot`
+is one of: a **data** slot (`is_empty=false, all_zeros=false`), a **zero write**
+(`all_zeros=true`, no data, applied as a range unmap), or **`Empty`** (`is_empty=true`); a
+requested LSN absent from the result means not-present-here.
 
 ---
 
@@ -239,5 +255,5 @@ is superseded. `CraftConnector` is the new frontend; `ScstConnector` is removed.
 |---|---|
 | `async_write(vol, addr, sgs)` | `write(term, lsn, lba, len, data)` |
 | `async_read(vol, addr, sgs)` | `read(term, readLSN, lba, len)` |
-| `async_unmap` (stub) | No equivalent in CRAFT v1 |
+| `async_unmap` (stub) | `write(..., all_zeros=true)` (WRITE_ZEROES / discard-to-zero) |
 | — | `login`, `commit`, `keep_alive`, `truncate`, `fetch_data`, `get_lsns`, `append` |

@@ -5,10 +5,11 @@ separates the data path from the consensus path: clients broadcast writes direct
 replicas at client-assigned LSNs, while RAFT is used only for leader election, login
 synchronization, and recovery bookkeeping. Write data never flows through the RAFT log.
 
-> **Canonical design:** the full, up-to-date CRAFT design is the
-> [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design) wiki page, which is
-> the source of truth. This folder holds reference detail the wiki summarizes: RPC wire
-> formats ([rpcs.md](rpcs.md)), the C++ API ([api.md](api.md)), and the implementation work
+> **Canonical design:** the CRAFT design lives in two wiki pages: the store-agnostic protocol,
+> [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design), and its HomeStore
+> implementation, [**CRAFT on HomeBlocks**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-on-HomeBlocks).
+> Together they are the source of truth. This folder holds reference detail they summarize: RPC
+> wire formats ([rpcs.md](rpcs.md)), the C++ API ([api.md](api.md)), and the implementation work
 > breakdown ([subtasks.md](subtasks.md)).
 
 ## Documents
@@ -38,7 +39,9 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | **SyncRSCommitLSN** | A RAFT log entry type. On apply, each replica fetches any missing data up to the encoded dLSN and advances `commit_lsn`. |
 | **InternalLogin** | A RAFT log entry type. On apply, stores the new `client_token` and enforces single-writer exclusivity. |
 | **Missing** | A dLSN slot that a replica knows about (from a peer or from the RAFT log) but has not yet received data for. |
-| **Empty** | A dLSN that was never received by any replica and is not discoverable during resync. Treated as a no-op hole. |
+| **Empty** | A dLSN proven never quorum-durable, declared by the leader; a permanent no-op the commit skips. |
+| **all_zeros (zero write)** | A payload-free write naming just an LBA range (the WRITE_ZEROES / discard-to-zero op). Takes a dLSN and merges like any write; allocates nothing and unmaps its range on apply. |
+| **hole** | A read sub-range with no data (never written, zero-written, or an all-zero region collapsed at read time). Returned as a marker, read as zeros; **not** the same as `Missing`. |
 
 ## Key design properties
 
@@ -47,6 +50,7 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 - **Client drives commit**: replicas apply to the index only when told (via `commit` / `keep_alive`), strictly in dLSN order at the contiguous frontier. Readability is per-write and does not wait: appended entries are served from the journal-tail overlay (no index write on the read path).
 - **Client-routed reads**: reads are unicast, chosen by LBA-overlap against the client's per-replica Missing map (plus `Synced ≥ L`, the login dLSN). The read path never fetches from a peer; fetch is resync-only.
 - **Merge key, not serialization**: overlapping writes need no ordering; highest dLSN per LBA wins on every replica.
+- **Thin from the start**: a write may be `all_zeros` (WRITE_ZEROES) with no payload; reads return sparse results (data extents + holes), and the server collapses all-zero reads to holes, so reads and resync stay thin. A hole is not `Missing`.
 - **Reconfiguration leans on HomeStore**: `replace_member` / learner / snapshot / CP (see the wiki and subtasks S10).
 - **Server-side resync**: `SyncRSCommitLSN` lets replicas catch up from each other without client involvement.
 - **No HomeStore changes needed**: `CraftReplDev` is built entirely on top of existing HomeStore journal/index/block primitives.

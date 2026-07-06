@@ -4,7 +4,9 @@
 RAFT internal RPCs (heartbeat, vote, membership) are not listed here.
 
 > **Canonical design:** the [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design)
-> wiki page is the source of truth; this file is the RPC wire-format reference.
+> wiki page is the source of truth for the protocol, and
+> [**CRAFT on HomeBlocks**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-on-HomeBlocks) for the
+> implementation binding; this file is the RPC wire-format reference.
 
 ---
 
@@ -31,15 +33,20 @@ HomeBlocks handler: `CraftReplDev::login()`
 ### 2. Write (Broadcast to all replicas)
 
 ```
-Request:  { term: uint64, lsn: int64, lba: uint64, len: uint32, data: bytes }
+Request:  { term: uint64, lsn: int64, lba: uint64, len: uint32, all_zeros: bool, data: bytes }
 Response: { status: Status }
 ```
 
-Client sends to every replica in the set in parallel. Each replica appends `data` to its
-data journal at slot `lsn` and ACKs immediately. Write is durable once quorum ACKs.
-Data is **not** readable until committed.
+Client sends to every replica in the set in parallel. Each replica appends the entry to its
+data journal at slot `lsn` and ACKs immediately. Write is durable once quorum ACKs, and
+readable once Appended (served from the journal-tail overlay until applied).
 
-Zero-copy is required: `data` must not be copied during journal append.
+Two forms. A **data write** (`all_zeros=false`) carries `data`; zero-copy is required (`data`
+must not be copied during journal append). A **zero write** (`all_zeros=true`, the WRITE_ZEROES
+/ discard-to-zero op) omits `data`: the slot is metadata-only, allocates no blocks, and on apply
+unmaps its range. Both take a `dLSN` and merge by highest-`dLSN`-per-LBA. The client sets
+`all_zeros` when a client-side scan finds an all-zero buffer; the server does **not** re-scan a
+data write.
 
 HomeBlocks handler: `CraftReplDev::write()`
 
@@ -49,7 +56,7 @@ HomeBlocks handler: `CraftReplDev::write()`
 
 ```
 Request:  { term: uint64, readLSN: int64, lba: uint64, len: uint32 }
-Response: { status: Status, data: bytes }
+Response: { status: Status, extents: [{ lba: uint64, len: uint32, hole: bool, data: bytes }] }
 ```
 
 `readLSN` is the read horizon `H` (the client's contiguous quorum-acked prefix); the read
@@ -62,6 +69,11 @@ sub-quorum tail), which is the server-side half of read safety. Because the clie
 to a servable
 replica, **the read path never fetches from a peer**; large multi-LBA reads may be split
 across replicas.
+
+The response is **sparse**: data extents interleaved with **holes** (`hole=true`, no `data`). A
+hole is an LBA sub-range that is never-written, zero-written (`all_zeros`), or an all-zero region
+the replica collapsed by a read-time scan; the client reads it as zeros. A hole is **not**
+`Missing` (the client routes around Missing slots, never around holes).
 
 HomeBlocks handler: `CraftReplDev::read()`
 
@@ -125,13 +137,14 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ```
 Request:  { lsns: [int64] }
-Response: { slots: [{ lsn: int64, is_empty: bool, lba: uint64, len: uint32, data: bytes }] }
+Response: { slots: [{ lsn: int64, is_empty: bool, all_zeros: bool, lba: uint64, len: uint32, data: bytes }] }
 ```
 
 Called when a replica discovers it is missing data for certain LSNs after receiving a
-`SyncRSCommitLSN` RAFT entry. **Three-way per slot:** an entry with `is_empty=false` carries
-`data`; `is_empty=true` means the peer has **positively** marked that slot `Empty` in a prior
-resync; a requested `lsn` **omitted** from `slots` means *not-present-here*. A peer never
+`SyncRSCommitLSN` RAFT entry. **Four-way per slot:** an entry with `is_empty=false,
+all_zeros=false` carries `data`; `all_zeros=true` is a **zero write** (no `data`, applied as a
+range unmap); `is_empty=true` means the peer has **positively** marked that slot `Empty` in a
+prior resync; a requested `lsn` **omitted** from `slots` means *not-present-here*. A peer never
 returns `is_empty=true` for a slot it merely lacks. The `Empty` **verdict itself is
 leader-only**: the leader runs the broadcast-and-accumulate quorum procedure (itself
 included; non-responders never count) before proposing `SyncRSCommitLSN`, and distributes
