@@ -98,12 +98,13 @@ TEST(CraftMemModel, LoginEstablishesSession) {
     EXPECT_EQ(lr->lba_size, PAGE); // the client aligns addr/len to this
 }
 
-// login sent to a follower is rejected with the leader hint.
-TEST(CraftMemModel, LoginOnFollowerIsNotLeader) {
+// login sent to a follower returns a redirect (term==0, leader_hint set) -- not an error.
+TEST(CraftMemModel, LoginOnFollowerReturnsLeaderHint) {
     auto g = make_mem_replica_group(new_vol(), 3, PAGE);
     auto lr = rg(g.replicas[1]->login(TOKEN));
-    ASSERT_FALSE(lr.has_value());
-    EXPECT_EQ(lr.error(), make_error_condition(craft_error::NOT_LEADER));
+    ASSERT_TRUE(lr.has_value());
+    EXPECT_EQ(lr->term, 0u);                             // term==0 signals redirect
+    EXPECT_EQ(lr->leader_hint, g.replicas[0]->id());     // replica 0 is the default leader
 }
 
 // 2. broadcast a write, advance the frontier via keep_alive, read it back.
@@ -344,4 +345,40 @@ TEST(CraftMemModel, SubQuorumFault) {
         if (rg(r->write(chdr(term), 1, blk(5), blk(1), one_iov(buf))).has_value()) ++acks;
     }
     EXPECT_EQ(acks, 3); // all members accept again
+}
+
+// 14. explicit logout clears the session on all replicas; subsequent IOs fail with STALE_TERM.
+TEST(CraftMemModel, LogoutClearsSession) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    ASSERT_TRUE(rg(g.replicas[0]->logout(chdr(term))).has_value());
+
+    // All replicas should now reject the old term.
+    auto buf = page_of(1);
+    for (auto& r : g.replicas) {
+        auto bad = rg(r->write(chdr(term), 0, blk(5), blk(1), one_iov(buf)));
+        ASSERT_FALSE(bad.has_value());
+        EXPECT_EQ(bad.error(), make_error_condition(craft_error::STALE_TERM));
+    }
+}
+
+// 15. logout from a follower is rejected with NOT_LEADER.
+TEST(CraftMemModel, LogoutOnFollowerReturnsNotLeader) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto bad = rg(g.replicas[1]->logout(chdr(term)));
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_EQ(bad.error(), make_error_condition(craft_error::NOT_LEADER));
+}
+
+// 16. logout is term-fenced: a stale client cannot tear down an active session.
+TEST(CraftMemModel, LogoutIsTermFenced) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto stale = rg(g.replicas[0]->logout(chdr(term + 1)));
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), make_error_condition(craft_error::STALE_TERM));
+    // Session is still alive; a write with the real term still works.
+    auto buf = page_of(1);
+    EXPECT_TRUE(rg(g.replicas[0]->write(chdr(term), 0, blk(5), blk(1), one_iov(buf))).has_value());
 }

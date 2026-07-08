@@ -59,20 +59,26 @@ public:
 
     // ── client-facing (what a CRAFT client issues against this one replica) ──
 
-    // Leader-only: run the login orchestration and return the members, starting dLSN, and term.
-    // A non-leader replica returns craft_error::NOT_LEADER.
+    // Login: run the session-establishment sequence. A follower returns LoginResult{term=0, leader_hint}
+    // (not an error) so the client can redirect; craft_error::NO_QUORUM / REPLICA_DOWN are errors.
     virtual async_result< LoginResult > login(uint64_t client_token) = 0;
+
+    // Explicit logout. Term-fenced; leader propagates InternalLogout to all live replicas so subsequent
+    // IOs with the old term fail with STALE_TERM. Returns craft_error::NOT_LEADER on a follower.
+    virtual async_status logout(client_hdr hdr) = 0;
 
     // Append one client-assigned write at slot `dlsn`. `addr`/`len` are BYTE offset/length, aligned to
     // the volume's lba_size (else std::errc::invalid_argument). `data` is a caller-owned (iomgr) buffer:
     // empty (size 0) => a zero write (WRITE_ZEROES / unmap; `len` is the range); non-empty => a data
-    // write of exactly `len` bytes. Does NOT apply to the index; the frontier is advanced by
-    // hdr.commit_lsn (piggybacked commit). craft_error::STALE_TERM if hdr.term != the session term.
+    // write of exactly `len` bytes (scatter-gather, any iovec count). Does NOT apply to the index; the
+    // frontier is advanced by hdr.commit_lsn (piggybacked commit). craft_error::STALE_TERM if
+    // hdr.term != the session term.
     virtual async_status write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list data) = 0;
 
     // Latest version <= read_lsn (horizon H) for [addr, addr+len) (BYTE offset/length, aligned). Fills the
-    // caller-owned `dest` buffer in place (data sub-ranges get bytes, holes get zeros) and returns the
-    // sparse layout (data vs holes). Advances the frontier to hdr.commit_lsn. STALE_TERM on term mismatch.
+    // caller-owned `dest` buffer in place (scatter-gather; data sub-ranges get bytes, holes get zeros) and
+    // returns the sparse layout (data vs holes). Advances the frontier to hdr.commit_lsn. STALE_TERM on
+    // term mismatch.
     virtual async_result< std::vector< io_extent > > read(client_hdr hdr, int64_t read_lsn, uint64_t addr,
                                                           uint64_t len, sisl::sg_list dest) = 0;
 
@@ -81,11 +87,11 @@ public:
     // achieved {commit_lsn, last_append_lsn}. No standalone commit verb; keep_alive is its carrier.
     virtual async_result< LSNPair > keep_alive(client_hdr hdr) = 0;
 
-    // Snapshot {commit_lsn, last_append_lsn}.
-    virtual async_result< LSNPair > get_lsns() = 0;
-
     // ── peer-facing (server-to-server; driven by the cold path / resync, never by a client) ──
 
+    // Snapshot {commit_lsn, last_append_lsn} for this replica -- used by the leader during
+    // GetRSCommitLSN polls and SyncRSCommitLSN rounds; identical to what keep_alive returns.
+    virtual async_result< LSNPair > get_lsns() = 0;
     virtual async_result< LSNPair > get_rs_commit_lsn() = 0;
     virtual async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns) = 0;
     virtual async_status truncate(int64_t lsn) = 0;

@@ -37,6 +37,12 @@ async_result< LoginResult > login(volume_handle const& vol, uint64_t client_toke
     co_return co_await b->login(client_token);
 }
 
+async_status logout(volume_handle const& vol, client_hdr hdr) {
+    auto* b = craft_backend_of(vol);
+    if (!b) co_return no_craft_backend();
+    co_return co_await b->logout(hdr);
+}
+
 async_status async_write(volume_handle const& vol, client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                          sisl::sg_list data) {
     auto* b = craft_backend_of(vol);

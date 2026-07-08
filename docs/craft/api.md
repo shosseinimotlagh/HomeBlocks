@@ -71,18 +71,21 @@ not persist it).
 ```cpp
 struct LoginResult {
     std::vector<replica_endpoint> members;
-    int64_t  dLSN;      // starting (per-partition) LSN for new IO
-    uint64_t term;
-    uint32_t lba_size;  // block size in bytes: the client aligns addr/len to it and presents geometry to the FS
+    int64_t            dLSN;         // starting (per-partition) LSN for new IO
+    uint64_t           term;         // 0 == NOT_LEADER redirect; >0 == session term
+    uint32_t           lba_size;     // block size in bytes: client aligns addr/len to it
+    boost::uuids::uuid leader_hint;  // non-nil iff redirect (term==0); retry login there
 };
 
 async_result<LoginResult> login(volume_handle const& vol, uint64_t client_token);
 ```
 
-Leader-only. Orchestrates the full login sequence (GetRSCommitLSN broadcast → optional FetchData →
-`SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once both RAFT entries commit. A follower
-fails with `craft_error::NOT_LEADER`. Postconditions: all quorum members have
-`commit_lsn == rs_commit_lsn`; all reject IO whose `term` != the new session term.
+Orchestrates the full login sequence (GetRSCommitLSN broadcast → optional FetchData →
+`SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once both RAFT entries commit. **A follower
+returns LoginResult with `term==0` and `leader_hint` set to the current leader's id (not an error)**;
+the client finds the matching handle by id and retries login there. `NO_QUORUM` / `REPLICA_DOWN` are
+returned as errors. Postconditions: all quorum members have `commit_lsn == rs_commit_lsn`; all reject
+IO whose `term` != the new session term.
 
 ---
 
@@ -123,6 +126,18 @@ piggybacks a frontier advance. Rejects on term mismatch / misalignment.
 
 ---
 
+### `logout`
+
+```cpp
+async_status logout(volume_handle const& vol, client_hdr hdr);
+```
+
+Explicit session teardown. Term-fenced (`hdr.term` must match the session term). The leader commits an
+`InternalLogout` entry, which clears `client_token` and `term` on all live replicas; subsequent IOs from
+the old client fail with `craft_error::STALE_TERM`. Returns `craft_error::NOT_LEADER` on a follower.
+
+---
+
 ### `keep_alive`
 
 ```cpp
@@ -145,22 +160,19 @@ quorum-acked writes.
 
 ---
 
-### `get_lsns`
-
-```cpp
-struct LSNPair { int64_t commit_lsn; int64_t last_append_lsn; };
-
-async_result<LSNPair> get_lsns(volume_handle const& vol);
-```
-
-Returns `{commit_lsn, last_append_lsn}` for the local partition. Used by peers via `GetRSCommitLSN`
-during login and by the leader during `SyncRSCommitLSN`.
-
----
-
 ## Internal / peer & RAFT-entry API
 
 These are on the `craft_replica` backend, not the public client surface.
+
+### `get_lsns` / `get_rs_commit_lsn`
+
+```cpp
+async_result<LSNPair> get_lsns();           // local snapshot of {commit_lsn, last_append_lsn}
+async_result<LSNPair> get_rs_commit_lsn();  // alias; used by the login leader's GetRSCommitLSN broadcast
+```
+
+Peer-to-peer; not a client-facing free function. The login leader polls all replicas via
+`get_rs_commit_lsn` to compute `rs_commit_lsn = max(quorum.last_append_lsn)`.
 
 ### `truncate`
 
@@ -171,16 +183,6 @@ async_status truncate(int64_t lsn);
 Drop all journal entries with `dLSN > lsn` (stale prior-term tail; login truncation after
 `InternalLogin` commits).
 
-### `append` (propose SyncRSCommitLSN)
-
-```cpp
-async_status append(int64_t sync_to, uint64_t client_token);
-```
-
-Propose a `SyncRSCommitLSN` RAFT entry. The leader first resolves every unresolved slot ≤ `sync_to`
-(fetch from a holder, or an `Empty` verdict on quorum-lacks evidence) and attaches `empty_slots[]`; it
-never proposes past an unresolved slot.
-
 ### `fetch_data` (peer resync)
 
 ```cpp
@@ -190,10 +192,6 @@ async_result<std::vector<JournalSlot>> fetch_data(std::vector<int64_t> lsns);
 Server-to-server raw journal read during `SyncRSCommitLSN` apply. Each `JournalSlot` is one of: a data
 slot, a zero write (`all_zeros=true`, no data), or `Empty` (`is_empty=true`); a requested LSN absent
 from the result means not-present-here.
-
-### `get_rs_commit_lsn`
-
-Alias of `get_lsns` exposed to peers during the `GetRSCommitLSN` broadcast.
 
 ### RAFT state machine entries
 

@@ -41,14 +41,15 @@ public:
 
     // ── craft_replica: client-facing ──
     async_result< LoginResult > login(uint64_t client_token) override;
+    async_status               logout(client_hdr hdr) override;
     async_status               write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                                      sisl::sg_list data) override;
     async_result< std::vector< io_extent > > read(client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
                                                   sisl::sg_list dest) override;
     async_result< LSNPair >    keep_alive(client_hdr hdr) override;
-    async_result< LSNPair >    get_lsns() override;
 
     // ── craft_replica: peer-facing (driven by MemTransport) ──
+    async_result< LSNPair >                    get_lsns() override;
     async_result< LSNPair >                    get_rs_commit_lsn() override;
     async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns) override;
     async_status                               truncate(int64_t lsn) override;
@@ -81,6 +82,7 @@ private:
     result< std::vector< JournalSlot > > do_fetch(std::vector< int64_t > const& lsns);
 
     // helpers (mu_ held by caller)
+
     void                  apply_up_to(int64_t target);
     void                  apply_slot(int64_t dlsn, MemJournalSlot const& s);
     // Fill `dest` for byte range [addr,addr+len) (data -> bytes, holes -> zeros) and return the layout.
@@ -91,6 +93,7 @@ private:
     LSNPair peek_lsns();
     void    cold_apply_sync(int64_t rs_commit_lsn, uint64_t client_token);
     void    cold_apply_login(uint64_t client_token, uint64_t term);
+    void    cold_apply_logout();
     void    cold_truncate_above(int64_t rs_commit_lsn);
 
     replica_endpoint                    ep_;

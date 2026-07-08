@@ -161,10 +161,16 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // model in src/lib/craft/memory). Unlike the byte-based legacy API above, these are LBA-based and
 // carry the session `term` and client-assigned `dLSN` / `read_lsn` that CRAFT defines. Errors ride
 // craft_error (e.g. STALE_TERM, NOT_LEADER). See docs/craft/api.md and the CRAFT-Design wiki.
+// Note: login() returns a LoginResult redirect (term==0) on NOT_LEADER, not a craft_error.
 
-// Leader-only. Establishes the session; returns the members, the starting dLSN for new I/O, and the
-// term. Sent to the replica believed to be leader; a follower fails with craft_error::NOT_LEADER.
+// Establishes the session; returns members, starting dLSN, and term. A follower returns a redirect
+// LoginResult (term==0, leader_hint set) -- not an error -- so the client can retry the right replica.
+// Other failures (NO_QUORUM, REPLICA_DOWN) are returned as errors.
 [[nodiscard]] async_result< LoginResult > login(volume_handle const& vol, uint64_t client_token);
+
+// Explicit session teardown. Term-fenced; leader propagates InternalLogout to all live replicas so
+// subsequent IOs from the old client fail with STALE_TERM. Returns NOT_LEADER on a follower.
+[[nodiscard]] async_status logout(volume_handle const& vol, client_hdr hdr);
 
 // Append one client-assigned write at slot `dlsn`. `addr`/`len` are BYTE offset/length and must be
 // aligned to the volume's lba_size (from LoginResult), else std::errc::invalid_argument. `data` is a

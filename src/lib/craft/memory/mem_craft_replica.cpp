@@ -51,6 +51,14 @@ async_result< LoginResult > MemCraftReplica::login(uint64_t client_token) {
     if (!net_->is_up(ep_.id)) co_return fail(craft_error::REPLICA_DOWN);
     co_return net_->run_login(this, client_token);
 }
+async_status MemCraftReplica::logout(client_hdr hdr) {
+    if (net_ && !net_->is_up(ep_.id)) co_return fail(craft_error::REPLICA_DOWN);
+    {
+        std::lock_guard< std::mutex > g{mu_};
+        if (hdr.term != state_.term) co_return fail(craft_error::STALE_TERM);
+    }
+    co_return net_ ? net_->run_logout(this, hdr.term) : ok();
+}
 async_status MemCraftReplica::write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                                     sisl::sg_list data) {
     co_return do_write(hdr, dlsn, addr, len, std::move(data));
@@ -86,12 +94,10 @@ status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, ui
     slot.len = static_cast< lba_count_t >(len / page_size_); // byte length -> block count
     slot.all_zeros = (data.size == 0); // empty sg_list => zero write (WRITE_ZEROES); no all_zeros flag
     if (!slot.all_zeros) {
-        // a data write is a single contiguous buffer of exactly `len` bytes (redundant with `len`, which
-        // is the authoritative range for a zero write, so it stays on the signature).
-        if (data.iovs.size() != 1 || data.size != len) {
+        if (data.size != len) {
             return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
         }
-        slot.bytes = own_bytes(data);
+        slot.bytes = own_bytes(data); // own_bytes iterates all iovecs
     }
     journal_[dlsn] = std::move(slot);
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
@@ -106,7 +112,7 @@ result< std::vector< io_extent > > MemCraftReplica::do_read(client_hdr hdr, int6
     if (addr % page_size_ != 0 || len % page_size_ != 0 || len == 0) {
         return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
     }
-    if (dest.iovs.size() != 1 || dest.size < len) {
+    if (dest.size < len) {
         return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
     }
     std::lock_guard< std::mutex > g{mu_};
@@ -201,10 +207,30 @@ MemCraftReplica::MemJournalSlot const* MemCraftReplica::highest_slot_le(lba_t x,
 
 std::vector< io_extent > MemCraftReplica::read_range(int64_t H, uint64_t addr, uint64_t len,
                                                      sisl::sg_list const& dest) {
-    auto* out = static_cast< uint8_t* >(dest.iovs[0].iov_base); // caller buffer, >= len bytes
-    lba_t const       lba0 = addr / page_size_;                 // byte offset -> first block
+    lba_t const       lba0 = addr / page_size_;
     lba_count_t const nblk = static_cast< lba_count_t >(len / page_size_);
     std::vector< io_extent > layout;
+
+    // Scatter writer: advances through dest's iovecs sequentially, one page_size_ chunk at a time.
+    std::size_t iov_idx{0}, iov_off{0};
+    auto sg_write = [&](uint8_t const* src, std::size_t n) {
+        while (n > 0 && iov_idx < dest.iovs.size()) {
+            auto const& iov = dest.iovs[iov_idx];
+            std::size_t avail    = iov.iov_len - iov_off;
+            std::size_t to_write = std::min(n, avail);
+            auto*       dst      = static_cast< uint8_t* >(iov.iov_base) + iov_off;
+            if (src) {
+                std::memcpy(dst, src, to_write);
+                src += to_write;
+            } else {
+                std::memset(dst, 0, to_write);
+            }
+            n -= to_write;
+            iov_off += to_write;
+            if (iov_off == iov.iov_len) { ++iov_idx; iov_off = 0; }
+        }
+    };
+
     for (lba_count_t i = 0; i < nblk; ++i) {
         lba_t const x = lba0 + i;
         // Winner = highest-dLSN version <= H covering block x, between the applied index cell and the
@@ -223,13 +249,9 @@ std::vector< io_extent > MemCraftReplica::read_range(int64_t H, uint64_t addr, u
         // read-time scan: an all-zero data page reads back thin (as a hole).
         if (!hole && all_zero(page, page_size_)) hole = true;
 
-        // fill the caller's buffer in place: a data block gets its bytes, a hole gets zeros.
-        uint8_t* dst = out + static_cast< std::size_t >(i) * page_size_;
-        if (hole) {
-            std::memset(dst, 0, page_size_);
-        } else {
-            std::memcpy(dst, page, page_size_);
-        }
+        // fill the caller's scatter-gather buffer: data pages get bytes, holes get zeros.
+        sg_write(hole ? nullptr : page, page_size_);
+
         // coalesce the returned layout, in BYTES, with the previous extent if contiguous.
         uint64_t const x_addr = static_cast< uint64_t >(x) * page_size_;
         if (!layout.empty() && layout.back().hole == hole && layout.back().addr + layout.back().len == x_addr) {
@@ -256,6 +278,11 @@ void MemCraftReplica::cold_apply_login(uint64_t client_token, uint64_t term) {
     std::lock_guard< std::mutex > g{mu_};
     state_.client_token = client_token;
     state_.term = term;
+}
+void MemCraftReplica::cold_apply_logout() {
+    std::lock_guard< std::mutex > g{mu_};
+    state_.client_token = 0;
+    state_.term = 0; // no active session; subsequent IOs with old term fail STALE_TERM
 }
 void MemCraftReplica::cold_truncate_above(int64_t rs_commit_lsn) {
     std::lock_guard< std::mutex > g{mu_};

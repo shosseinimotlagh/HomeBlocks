@@ -107,12 +107,13 @@ TEST(CraftMemE2E, LoginWriteCommitReadViaPublicApi) {
     EXPECT_EQ(dest, buf);
 }
 
-// login to a follower handle is rejected NOT_LEADER through the public API.
-TEST(CraftMemE2E, LoginOnFollowerRejected) {
+// login to a follower handle returns a redirect (term==0, leader_hint) through the public API.
+TEST(CraftMemE2E, LoginOnFollowerReturnsLeaderHint) {
     auto set = craft::make_memory_replica_set(mk_info(), 3);
     auto lr = rg(login(set.handles[1], TOKEN));
-    ASSERT_FALSE(lr.has_value());
-    EXPECT_EQ(lr.error(), make_error_condition(craft_error::NOT_LEADER));
+    ASSERT_TRUE(lr.has_value());
+    EXPECT_EQ(lr->term, 0u);                             // term==0 signals redirect
+    EXPECT_EQ(lr->leader_hint, set.net->leader());       // hint points at the current leader
 }
 
 // a zero write (empty buffer) reads back as a hole through the public API.
@@ -131,6 +132,24 @@ TEST(CraftMemE2E, ZeroWriteHoleViaPublicApi) {
     ASSERT_EQ(rr->size(), 1u);
     EXPECT_TRUE((*rr)[0].hole);
     EXPECT_EQ(dest, page_of(0));
+}
+
+// explicit logout tears down the session; subsequent writes via the public API fail with STALE_TERM.
+TEST(CraftMemE2E, LogoutClearsSessionViaPublicApi) {
+    auto set = craft::make_memory_replica_set(mk_info(), 3);
+    auto lr = rg(login(set.handles[0], TOKEN));
+    ASSERT_TRUE(lr.has_value());
+    uint64_t const term = lr->term;
+
+    ASSERT_TRUE(rg(logout(set.handles[0], chdr(term))).has_value());
+
+    // All handles should now reject the old term.
+    auto buf = page_of(0x5A);
+    for (auto& h : set.handles) {
+        auto bad = rg(async_write(h, chdr(term), 0, blk(0), blk(1), one_iov(buf)));
+        ASSERT_FALSE(bad.has_value());
+        EXPECT_EQ(bad.error(), make_error_condition(craft_error::STALE_TERM));
+    }
 }
 
 int main(int argc, char* argv[]) {

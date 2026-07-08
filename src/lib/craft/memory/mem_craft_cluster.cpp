@@ -88,7 +88,7 @@ result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t 
     {
         std::lock_guard< std::mutex > g{mu_};
         if (down_.contains(caller->id())) return fail(craft_error::REPLICA_DOWN);
-        if (caller->id() != leader_) return fail(craft_error::NOT_LEADER);
+        if (caller->id() != leader_) return LoginResult{{}, -1, 0, 0, leader_};
         live = live_replicas_locked();
         if (live.size() < quorum(members_.size())) return fail(craft_error::NO_QUORUM);
         nt = ++term_;
@@ -107,6 +107,19 @@ result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t 
         if (r->peek_lsns().last_append_lsn > rs) r->cold_truncate_above(rs);
     }
     return LoginResult{std::move(members_copy), rs, nt, lba_size_};
+}
+
+status MemTransport::run_logout(MemCraftReplica* caller, uint64_t term) {
+    std::vector< MemCraftReplica* > live;
+    {
+        std::lock_guard< std::mutex > g{mu_};
+        if (down_.contains(caller->id())) return fail(craft_error::REPLICA_DOWN);
+        if (caller->id() != leader_) return fail(craft_error::NOT_LEADER);
+        live = live_replicas_locked();
+    }
+    // InternalLogout: clear the session on all live replicas. Term was already checked by the caller.
+    for (auto* r : live) r->cold_apply_logout();
+    return ok();
 }
 
 // ── group factory (model level; no volumes attached) ──

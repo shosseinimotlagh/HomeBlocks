@@ -67,11 +67,16 @@ struct client_hdr {
 // Returned by login(): the replica set, the starting dLSN for new I/O, the session term, and the block
 // size. `lba_size` is the volume's block size in bytes -- the client aligns every addr/len to it and
 // uses it to present the volume geometry to the filesystem.
+//
+// NOT_LEADER redirect: when login() is sent to a follower the call still succeeds (not an error), but
+// `term == 0` and `leader_hint` is the id of the current leader; all other fields are unset. The client
+// finds the matching handle by id and retries login there. `term > 0` always means a successful login.
 struct LoginResult {
     std::vector< replica_endpoint > members;
-    int64_t  dLSN{-1}; // starting (per-partition) LSN for new I/O
-    uint64_t term{0};
-    uint32_t lba_size{0}; // block size in bytes (alignment unit for addr/len)
+    int64_t            dLSN{-1};        // starting (per-partition) LSN for new I/O
+    uint64_t           term{0};         // 0 == NOT_LEADER redirect; >0 == session term
+    uint32_t           lba_size{0};     // block size in bytes (alignment unit for addr/len)
+    boost::uuids::uuid leader_hint{};   // non-nil iff this is a redirect (term==0); retry login there
 };
 
 // One sub-range of a contiguous IO's sparse layout, in BYTES: a data extent (hole=false) or a hole
@@ -90,7 +95,7 @@ struct io_extent {
 // Anything with a standard equivalent is still returned via std::make_error_condition(std::errc::*).
 ENUM(craft_error, uint16_t,
      STALE_TERM = 1, // IO term != session term (the protocol's ETERM)
-     NOT_LEADER,     // login / leader-only op sent to a follower
+     NOT_LEADER,     // leader-only op (logout) sent to a follower; login returns a redirect instead
      NO_QUORUM,      // could not reach a quorum of live replicas
      WRONG_TOKEN,    // client_token is not the current owner
      NOT_ELIGIBLE,   // replica cannot serve this read (Missing overlap / below login-dLSN L)

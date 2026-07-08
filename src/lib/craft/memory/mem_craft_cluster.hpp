@@ -46,10 +46,14 @@ public:
     // Called by create_memory_volume / make_mem_replica_group as each replica is built.
     void register_replica(MemCraftReplica* r);
 
-    // ── cold path: leader-only login orchestration (GetRSCommitLSN -> SyncRSCommitLSN -> InternalLogin) ──
-    // `caller` is the replica the client invoked login() on. Returns craft_error::NOT_LEADER if it is
-    // not the leader, or NO_QUORUM if a live majority is not reachable.
+    // ── cold path: leader-only orchestration ──
+    // login: GetRSCommitLSN -> SyncRSCommitLSN -> InternalLogin. A non-leader returns LoginResult with
+    // term==0 and leader_hint set (not an error). NO_QUORUM / REPLICA_DOWN are errors.
     result< LoginResult > run_login(MemCraftReplica* caller, uint64_t client_token);
+
+    // logout: InternalLogout applied to all live replicas. term-fenced. Returns NOT_LEADER if caller
+    // is not the leader.
+    status run_logout(MemCraftReplica* caller, uint64_t term);
 
     // ── membership / routing (consulted by the replicas' client-facing ops) ──
     peer_id_t   leader() const;
