@@ -33,7 +33,7 @@
 #include <gtest/gtest.h>
 
 #include "coro_helpers.hpp"
-#include "craft/memory/mem_craft_cluster.hpp"
+#include "model/mem_craft_cluster.hpp"
 
 using namespace homeblocks;
 using namespace homeblocks::craft;

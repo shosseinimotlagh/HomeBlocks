@@ -158,7 +158,7 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // per-partition dLSN to each write, broadcasts async_write to every member itself, tallies quorum,
 // and routes async_read (carrying the horizon `read_lsn` = H) to one eligible member. The handle
 // comes from create_volume (production, later) or create_memory_volume (the in-memory reference
-// model in src/lib/craft/memory). Unlike the byte-based legacy API above, these are LBA-based and
+// model in src/test/craft/model). Unlike the byte-based legacy API above, these are LBA-based and
 // carry the session `term` and client-assigned `dLSN` / `read_lsn` that CRAFT defines. Errors ride
 // craft_error (e.g. STALE_TERM, NOT_LEADER). See docs/craft/api.md and the CRAFT-Design wiki.
 // Note: login() returns a LoginResult redirect (term==0) on NOT_LEADER, not a craft_error.

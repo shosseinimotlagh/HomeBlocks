@@ -186,7 +186,7 @@ public:
     volume& operator=(volume const& volume) = delete;
     volume& operator=(volume&& volume) = default;
 
-    // Tag + constructor for the in-memory CRAFT reference model (src/lib/craft/memory). Builds a
+    // Tag + constructor for the in-memory CRAFT reference model (src/test/craft/model). Builds a
     // HomeStore-free volume whose CRAFT data plane is served by `backend`; skips all HomeStore setup
     // (no repl_dev / index table / superblk write / chunk selectors / metrics). rd() and the index
     // paths must not be used on such a volume -- only the CRAFT free functions, which route to

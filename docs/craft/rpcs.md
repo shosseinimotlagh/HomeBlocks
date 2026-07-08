@@ -189,5 +189,5 @@ dependency). `CraftConnector` is transport-agnostic: it will dispatch via whatev
 selects (likely gRPC or a custom framing over TCP). Server-to-server RPCs use the same transport.
 
 During development, before CRAFT-1 lands, the calls are exercised in-process via direct function calls:
-the [in-memory reference model](../../src/lib/craft/memory/) implements the same per-replica surface
+the [in-memory reference model](../../src/test/craft/model/) implements the same per-replica surface
 (`craft_replica`) behind a `volume_handle`, with `MemTransport` standing in for the network.

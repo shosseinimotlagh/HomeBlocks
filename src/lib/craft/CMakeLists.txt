@@ -9,9 +9,6 @@ target_link_libraries(${PROJECT_NAME}_craft
     ${COMMON_DEPS}
 )
 
-# In-memory CRAFT reference model (HomeStore-free). Built by default; toggle off to exclude it and
-# its tests from the build.
-option(HB_BUILD_CRAFT_MEMORY_MODEL "Build the in-memory CRAFT reference model + tests" ON)
-if (HB_BUILD_CRAFT_MEMORY_MODEL)
-    add_subdirectory(memory)
-endif()
+# The in-memory CRAFT reference model is NOT part of the shipped library. It (and the reference client
+# + ublk driver that drive it) live under src/test/craft, so the whole thing can be dropped when the
+# production CRAFT path lands. Only the client-facing API impl above (craft_api.cpp) ships here.

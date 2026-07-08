@@ -1,36 +1,20 @@
 cmake_minimum_required (VERSION 3.11)
 
-# Test-only ublk adapter. Relax pedantic/unused-parameter for the kernel UAPI headers (ublk_cmd.h,
-# ublksrv.h) pulled in transitively via ublkpp; keep -Werror/-Wall/-Wextra. Demote (not silence) the
-# deprecation warning: homeblk_disk.cpp still calls the legacy async_read/async_write on purpose.
-add_flags("-Wno-pedantic -Wno-unused-parameter -Wno-error=deprecated-declarations")
-
-# ublkpp is a test_requires; if it isn't available (e.g. a tests-disabled build) skip the adapter+CLI.
+# Test-local, non-shipped code, grouped so each piece can be dropped as a unit:
+#   craft/       -- the CRAFT reference model + reference client + CRAFT ublk driver + their tests.
+#                   (model = throwaway once production CRAFT lands; client/driver graduate to src/lib.)
+#   legacy_ublk/ -- the original ublk driver over the deprecated volume block API (drop with that API).
+#
+# ublkpp (a test_requires) backs BOTH ublk drivers; detect it once here and let the subdirs gate their
+# ublk targets on UblkPP_FOUND (inherited into the child scopes). The CRAFT model + client + their unit
+# tests need no ublk device, so craft/ is always added; only the ublk driver targets are gated.
 find_package(UblkPP QUIET)
 if (NOT UblkPP_FOUND)
-    message(STATUS "ublkpp not found; skipping homeblk_ublk adapter/CLI")
-    return()
+    message(STATUS "ublkpp not found; the ublk drivers (craft_ublk / homeblk_ublk) will be skipped")
 endif()
 
-# Adapter: exposes a homeblocks volume as a ublkpp::ublk_disk.
-add_library(homeblk_ublk_disk OBJECT)
-target_sources(homeblk_ublk_disk PRIVATE
-    homeblk_disk.cpp
-)
-target_link_libraries(homeblk_ublk_disk
-    ${COMMON_DEPS}
-    UblkPP::UblkPP
-)
+add_subdirectory(craft)
 
-# CLI: brings up homeblocks and exposes a volume as /dev/ublkbN (ublkpp_disk-style).
-add_executable(homeblk_ublk)
-target_sources(homeblk_ublk PRIVATE
-    homeblk_ublk_cli.cpp
-    $<TARGET_OBJECTS:homeblk_ublk_disk>
-)
-target_link_libraries(homeblk_ublk
-    ${PROJECT_NAME}
-    ${COMMON_TEST_DEPS}
-    UblkPP::UblkPP
-    -rdynamic
-)
+if (UblkPP_FOUND)
+    add_subdirectory(legacy_ublk)
+endif()

@@ -20,7 +20,7 @@
 // like a production CRAFT volume_handle -- the API works whether the replicas are three servers or
 // three objects in one process. `make_memory_replica_set` stands up the whole in-process set.
 //
-// This is a NON-public header (src/lib): it pulls in volume.hpp, so a TU using it links HomeStore.
+// This is a test-local header (src/test/craft/model): it pulls in volume.hpp, so a TU using it links HomeStore.
 // The model itself (mem_craft_replica/cluster) stays HomeStore-free and is testable on its own.
 
 #include <cstdint>

@@ -6,7 +6,7 @@ header `home_blocks.hpp` (parallel to the existing `async_read`/`async_write` bl
 server; the client holds one handle per member and does the CRAFT work itself (assign `dLSN`,
 broadcast the write to every member, tally quorum, route the read to one member). The calls dispatch
 through an internal per-replica interface, `craft_replica`, which both the production `CraftReplDev`
-and the in-memory reference model (`src/lib/craft/memory/`) implement independently.
+and the in-memory reference model (`src/test/craft/model/`) implement independently.
 
 All methods are async/coroutine-style (`async_result<T>` / `async_status`) matching the existing
 HomeBlocks convention.

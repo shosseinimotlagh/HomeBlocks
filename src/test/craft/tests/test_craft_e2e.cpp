@@ -30,7 +30,7 @@
 #include <homeblks/home_blocks.hpp>
 
 #include "coro_helpers.hpp"
-#include "craft/memory/mem_craft_volume.hpp"
+#include "model/mem_craft_volume.hpp"
 
 // libhomeblocks defines the `homeblocks` log module in homeblks_impl.o, but this test never odr-uses
 // that object (it drives create_memory_volume, not init_homeblocks), so the static archive does not
