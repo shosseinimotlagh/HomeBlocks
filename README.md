@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-> A crash-consistent block-volume store built on [HomeStore](https://github.com/eBay/HomeStore) — thin-provisioned
+> A crash-consistent block-volume store built on [HomeStore](https://github.com/eBay/HomeStore) -- thin-provisioned
 > volumes with a replicated, checkpointed data path, exposed through a small C++23 coroutine API.
 
 HomeBlocks turns a set of raw devices into named **volumes**: each is a sparse, block-addressable store with its
@@ -11,20 +11,20 @@ and checkpoint machinery. The public surface is one header and a handful of coro
 
 ## 🚀 Features
 
-- **Volumes** — create / destroy / look up thin-provisioned block volumes; survive process restarts and crashes
+- **Volumes** -- create / destroy / look up thin-provisioned block volumes; survive process restarts and crashes
   via journal replay and a destroy-resume path.
-- **CRAFT I/O** — clients hold one `volume_handle` per replica and drive the protocol directly:
+- **CRAFT I/O** -- clients hold one `volume_handle` per replica and drive the protocol directly:
   `login` establishes the session term and starting dLSN, `async_write` (broadcast to all replicas at a
   client-assigned dLSN) ACKs on journal durability, `async_read` (unicast to a chosen eligible replica)
   returns a sparse `io_extent` layout, and `keep_alive` advances the commit watermark. All return lazy
   [stdexec](https://github.com/NVIDIA/stdexec) coroutines (`sisl::async::task`). No callbacks, no futures.
-- **One error surface** — every fallible call returns `std::expected<T, std::error_condition>`; CRAFT
+- **One error surface** -- every fallible call returns `std::expected<T, std::error_condition>`; CRAFT
   failures use `craft_error` (`STALE_TERM`, `NOT_LEADER`, `NO_QUORUM`, `REPLICA_DOWN`), control-plane
   failures use `volume_error`, everything else maps to `std::errc`. No exceptions on the I/O path.
-- **Opaque handles + factory init** — consumers never construct an implementation type; they hold a
+- **Opaque handles + factory init** -- consumers never construct an implementation type; they hold a
   `volume_handle` and a `std::shared_ptr<home_blocks>` produced by `init_homeblocks()`.
-- **Minimal surface** — the entire public API is a single installed header, `<homeblks/home_blocks.hpp>`.
-- **Replicated & checkpointed** — data, index, and journal flow through HomeStore's repl-dev / index / CP
+- **Minimal surface** -- the entire public API is a single installed header, `<homeblks/home_blocks.hpp>`.
+- **Replicated & checkpointed** -- data, index, and journal flow through HomeStore's repl-dev / index / CP
   services; HomeBlocks owns volume lifecycle and recovery on top.
 
 ## 📋 Table of Contents
@@ -78,7 +78,7 @@ conan build . -o "homeblocks/*:fixed_index=False" --build missing
 
 HomeBlocks is the volume layer. It owns volume identity and crash recovery. The replication protocol is
 **CRAFT** (Client Assisted RAFT): clients hold one `volume_handle` per replica and drive the data path
-themselves — broadcasts writes at client-assigned LSNs directly to all replicas (bypassing RAFT on the
+themselves -- broadcasts writes at client-assigned LSNs directly to all replicas (bypassing RAFT on the
 data path), each `CraftReplDev` appends to its data journal and ACKs on durability, and the commit
 watermark (piggybacked on writes and `keep_alive`) advances the LBA index in LSN order. RAFT is used
 only for leader election and login/logout synchronization. HomeStore provides the data journal, index, and
@@ -88,13 +88,13 @@ checkpoint services; iomgr provides the io_uring reactor model.
 graph TD
     app["Consumer<br/>(e.g. a CSI / target daemon)"]
 
-    subgraph hb["HomeBlocks — per replica"]
+    subgraph hb["HomeBlocks -- per replica"]
         hbi["home_blocks<br/>volume control plane + recovery"]
         craft["CraftReplDev<br/>login · write · read · keep_alive"]
     end
 
     subgraph hs["HomeStore"]
-        raft["RAFT<br/>leader election · login sync<br/>(control plane — not the data path)"]
+        raft["RAFT<br/>leader election · login sync<br/>(control plane -- not the data path)"]
         journal["data journal<br/>write-append · tail-overlay reads"]
         idx["index service<br/>LBA → blk"]
         cp["checkpoint (CP)"]
@@ -132,28 +132,28 @@ HomeBlocks/
 │   ├── craft/                   # CRAFT protocol: CraftReplDev, craft_replica, CRAFT API free functions
 │   ├── volume/                  # the volume: LBA index tables, chunk selector, io_req
 │   ├── listener.{hpp,cpp}       # HomeStore repl_dev_listener (on_commit / snapshot hooks)
-│   ├── hb_internal.hpp          # internal prelude (LOG* macros, size constants, aliases) — not installed
+│   ├── hb_internal.hpp          # internal prelude (LOG* macros, size constants, aliases) -- not installed
 │   └── tests/                   # gtest unit + I/O tests
 └── conanfile.py
 ```
 
 ### Core Abstractions
 
-- **`home_blocks`** — opaque handle to a running instance, produced by `init_homeblocks()`. Owns the volume
+- **`home_blocks`** -- opaque handle to a running instance, produced by `init_homeblocks()`. Owns the volume
   control plane (`create_volume` / `remove_volume` / `get_volume` / `volume_ids` / stats).
-- **`volume_handle`** (`std::shared_ptr<volume>`) — opaque handle to **one replica device**; the CRAFT free
+- **`volume_handle`** (`std::shared_ptr<volume>`) -- opaque handle to **one replica device**; the CRAFT free
   functions take it. In production the client holds one handle per member.
-- **`home_blocks_config`** — bring-up config (devices, reactor threads, memory budget, and a cold-boot
+- **`home_blocks_config`** -- bring-up config (devices, reactor threads, memory budget, and a cold-boot
   `on_svc_id` identity hook).
-- **`login` / `async_write` / `async_read` / `keep_alive`** — CRAFT client free functions over a
+- **`login` / `async_write` / `async_read` / `keep_alive`** -- CRAFT client free functions over a
   `volume_handle`. `login` orchestrates the full session setup (returns `LoginResult` with `term`, `dLSN`,
   `lba_size`, and member list). `async_write` takes a `client_hdr` and client-assigned dLSN; an empty
   `sg_list` is a zero-write (WRITE_ZEROES). `async_read` takes a read-horizon `read_lsn` and returns a
   sparse `io_extent` layout (data vs holes). `keep_alive` advances the commit watermark and resets the
   watchdog.
-- **`client_hdr`** — session + commit watermark stamped on every CRAFT I/O (`term`, `commit_lsn`,
-  `all_committed_lsn`); CRAFT's commit piggybacks on these calls — there is no standalone commit verb.
-- **`result<T>` / `async_result<T>`** — the synchronous and coroutine flavors of the one error surface.
+- **`client_hdr`** -- session + commit watermark stamped on every CRAFT I/O (`term`, `commit_lsn`,
+  `all_committed_lsn`); CRAFT's commit piggybacks on these calls -- there is no standalone commit verb.
+- **`result<T>` / `async_result<T>`** -- the synchronous and coroutine flavors of the one error surface.
 
 ## 📦 Using HomeBlocks
 
@@ -174,7 +174,7 @@ auto hb_res = init_homeblocks(home_blocks_config{
     // to an orchestrator. Resolve the (possibly rotated) client inside the closure.
     .on_svc_id = [&](/* */) -> async_result<peer_id_t> { co_return co_await orch.register_node(); },
 });
-if (!hb_res) { /* hb_res.error().message() — e.g. OM unreachable */ return; }
+if (!hb_res) { /* hb_res.error().message() -- e.g. OM unreachable */ return; }
 std::shared_ptr<home_blocks> hb = *hb_res;
 ```
 
@@ -189,7 +189,7 @@ sisl::async::task<void> demo(std::shared_ptr<home_blocks> hb) {
     auto vol = co_await hb->create_volume(volume_info{uuid, /*size*/ 1ull << 30, /*page_size*/ 4096, "vol1"});
     if (!vol) co_return;                            // vol.error()
 
-    // Login: unicast to the leader — returns {term, dLSN, lba_size, member list}.
+    // Login: unicast to the leader -- returns {term, dLSN, lba_size, member list}.
     auto lr = co_await login(*vol, client_token);
     if (!lr) co_return;                             // lr.error(): NO_QUORUM, REPLICA_DOWN, ...
     client_hdr hdr{.term = lr->term, .commit_lsn = -1};
@@ -201,11 +201,11 @@ sisl::async::task<void> demo(std::shared_ptr<home_blocks> hb) {
     auto w = co_await async_write(*vol, hdr, next_lsn++, /*addr=*/0, /*len=*/8192, sgs);
     if (!w) { /* w.error(): craft_error::STALE_TERM, std::errc::no_space_on_device, ... */ }
 
-    // Zero-write (WRITE_ZEROES / discard-to-zero): empty sg_list is the signal — no all_zeros flag.
+    // Zero-write (WRITE_ZEROES / discard-to-zero): empty sg_list is the signal -- no all_zeros flag.
     co_await async_write(*vol, hdr, next_lsn++, /*addr=*/8192, /*len=*/4096, {});
 
     // Commit piggybacks on the next write, read, or keep_alive via client_hdr::commit_lsn.
-    // Here the read carries it — no separate keep_alive needed.
+    // Here the read carries it -- no separate keep_alive needed.
     hdr.commit_lsn = next_lsn - 1;
     sisl::sg_list dest{.size = 8192, .iovs = {iovec{rbuf, 8192}}};
     auto layout = co_await async_read(*vol, hdr, /*read_lsn=*/next_lsn - 1, 0, 8192, dest);
@@ -218,7 +218,7 @@ From a non-coroutine context (a gRPC handler, `main`), drive the lazy task to co
 
 ### Error handling
 
-One surface — `std::expected<T, std::error_condition>`:
+One surface -- `std::expected<T, std::error_condition>`:
 
 ```cpp
 // Control plane
@@ -232,7 +232,7 @@ if (!v) {
 // CRAFT I/O
 auto w = co_await async_write(*vol, hdr, lsn, addr, len, sgs);
 if (!w) {
-    if (w.error() == craft_error::STALE_TERM)  { /* deposed — re-login */ }
+    if (w.error() == craft_error::STALE_TERM)  { /* deposed -- re-login */ }
     if (w.error() == std::errc::no_space_on_device) { /* out of space */ }
 }
 ```
@@ -283,21 +283,21 @@ build/Debug/src/lib/volume/tests/test_volume_io            --dev_size_mb=2048 --
 build/Debug/src/lib/volume/tests/test_volume_chunk_selector
 ```
 
-> Size test devices so the data/index **chunk size** fits — the defaults are large; pass
+> Size test devices so the data/index **chunk size** fits -- the defaults are large; pass
 > `--data_chunk_size_mb` / `--index_chunk_size_mb` for small backing files, otherwise the volume's chunk pool
 > comes up empty and `create_volume` fails.
 
 ### Exercising a volume as a real block device (ublk)
 
 Beyond the gtest suite, `src/test/` ships a small adapter that exposes a HomeBlocks volume as a Linux
-[ublk](https://docs.kernel.org/block/ublk.html) device (`/dev/ublkbN`) — so you can point **standard block
+[ublk](https://docs.kernel.org/block/ublk.html) device (`/dev/ublkbN`) -- so you can point **standard block
 tooling** (`fio`, `dd`, `mkfs`, `mount`) straight at the data path. The `homeblk_ublk` CLI brings up an instance,
 creates (or recovers) a volume, and serves its I/O on HomeBlocks' iomgr reactors via
 [ublkpp](https://github.com/eBay/ublkpp). It is built as part of the normal test build (ublkpp is a
 `test_requires`), landing at `build/Debug/src/test/homeblk_ublk`.
 
 **Prerequisites:** a `ublk_drv`-capable kernel (≥ 5.19; `sudo modprobe ublk_drv` if `/dev/ublk-control` is
-missing) and **root** — the control device is root-only.
+missing) and **root** -- the control device is root-only.
 
 ```bash
 # Bring up HomeBlocks on a backing device and expose a 1 GiB volume.
@@ -312,9 +312,9 @@ sudo build/Debug/src/test/homeblk_ublk \
 
 | Option | Meaning |
 |---|---|
-| `--device <path>[,...]` | HomeBlocks backing device(s). **Formatted on use — existing contents are destroyed.** |
+| `--device <path>[,...]` | HomeBlocks backing device(s). **Formatted on use -- existing contents are destroyed.** |
 | `--create_device` / `--dev_size_mb` | Create the backing path(s) as files of the given size first. |
-| `--vol_id <uuid>` | Volume to expose — recovered if it already exists, else created (default: random). |
+| `--vol_id <uuid>` | Volume to expose -- recovered if it already exists, else created (default: random). |
 | `--vol_size_mb` / `--page_size` | Volume size and logical block size (default 4096) when creating. |
 | `--num_threads` | HomeBlocks iomgr reactor count. |
 | `--data_chunk_size_mb` / `--index_chunk_size_mb` | HomeStore chunk sizing (see the note below). |
@@ -334,7 +334,7 @@ sudo fio --name=v --filename=$DEV --direct=1 --rw=randwrite --bs=4k --size=512M 
 sudo mkfs.ext4 -F $DEV && sudo mount $DEV /mnt && sudo cp -r some/files /mnt && sudo umount /mnt
 ```
 
-**Tear down** by `Ctrl-C`-ing `homeblk_ublk` — but **`umount` any filesystem first**: clean shutdown removes the
+**Tear down** by `Ctrl-C`-ing `homeblk_ublk` -- but **`umount` any filesystem first**: clean shutdown removes the
 ublk device, which blocks until it is unmounted. Volume data persists in the backing device; re-expose it later
 with the same `--vol_id` and **without** `--create_device`.
 
@@ -344,7 +344,7 @@ with the same `--vol_id` and **without** `--create_device`.
 > throughput dips and latency spikes. For a disk-free benchmark, back it with a ramdisk
 > (`sudo modprobe brd rd_nr=1 rd_size=$((12*1024*1024))` → `--device /dev/ram0`, no `--create_device`). One fio
 > gotcha: `--verify` with `--numjobs>1` over a *shared* range reports false mismatches (writers overwrite each
-> other's blocks) — give each job a disjoint `--offset_increment` region, or use a single writer.
+> other's blocks) -- give each job a disjoint `--offset_increment` region, or use a single writer.
 
 ## 📦 Dependencies
 
@@ -361,7 +361,7 @@ Built and packaged with Conan 2; requires C++23.
 
 ## 📚 Documentation
 
-- **[CHANGELOG.md](CHANGELOG.md)** — version history.
+- **[CHANGELOG.md](CHANGELOG.md)** -- version history.
 
 ## 📄 License
 
