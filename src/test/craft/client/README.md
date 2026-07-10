@@ -298,7 +298,7 @@ Also outstanding, in rough order:
   into one `delay`, and the reply is the coroutine's return value rather than a message. A peer that applies
   a write and then loses or delays its *reply* needs `request_latency` and `reply_latency` as separate legs.
 
-Writes now ack at quorum (`when_quorum`); reads do not, because they are unicast. A read that the leader
+Writes ack at quorum (`when_quorum`); reads do not, because they are unicast. A read that the leader
 cannot serve has no failover — that is the Missing map above, not a fan-out problem.
 
 ---
@@ -311,10 +311,10 @@ needs in order to survive it becomes a requirement we can shop for. This section
 output of the exercise, not an input to it.
 
 `MemTransport` therefore refuses to be convenient. It completes **no** op inline with its submit, dispatches
-completions from a pool of service threads so replies to one broadcast land **out of order and on different
-threads**, and lets K client threads drive one `craft_client` at once. None of that was true before: the
-fan-out ran sequentially on the issuing thread, `when_quorum` never suspended, and a straggler never raced
-anybody. A shim that comfortable teaches the client nothing.
+completions from per-replica pools of service threads so replies to one broadcast land **out of order and on
+different threads**, and lets K client threads drive one `craft_client` at once. A comfortable shim -- one whose
+fan-out runs sequentially on the issuing thread, whose `when_quorum` never suspends, whose stragglers never race
+anybody -- teaches the client nothing.
 
 | # | requirement | why the client needs it | who checks |
 |---|---|---|---|

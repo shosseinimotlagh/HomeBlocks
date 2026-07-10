@@ -218,8 +218,9 @@ the RPC layer and storage layer have a clean boundary with no storage logic in t
 
 **Acceptance criteria:**
 - `CraftConnector` class exists; transport is pluggable (CRAFT-1 spike determines final choice)
-- Client-facing handlers: `Login`, `Write`, `Read`, `Commit`, `KeepAlive`, `GetLSNs`
-- Server-to-server handlers: `GetRSCommitLSN`, `FetchData` (used during login and resync)
+- Client-facing handlers: `Login`, `Write`, `Read`, `KeepAlive` (there is no `Commit` verb: the watermark
+  rides on `client_hdr.commit_lsn`, see [rpcs.md](rpcs.md))
+- Server-to-server handlers: `GetRSCommitLSN`, `FetchData`, `GetLSNs` (used during login and resync)
 - Each handler translates NubloxProto types ↔ `CraftReplDev` types with no storage logic
 - Leader redirect: if a `Login` arrives at a follower, return leader endpoint
 - Term mismatch: return `ETERM` to client
