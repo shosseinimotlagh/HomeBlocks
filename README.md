@@ -134,6 +134,9 @@ HomeBlocks/
 │   ├── listener.{hpp,cpp}       # HomeStore repl_dev_listener (on_commit / snapshot hooks)
 │   ├── hb_internal.hpp          # internal prelude (LOG* macros, size constants, aliases) -- not installed
 │   └── tests/                   # gtest unit + I/O tests
+├── src/test/
+│   ├── craft/                   # CRAFT reference client + its ublk driver, and the in-memory replica model
+│   └── legacy_ublk/             # homeblk_ublk, over the deprecated block API
 └── conanfile.py
 ```
 
@@ -294,7 +297,7 @@ Beyond the gtest suite, `src/test/` ships a small adapter that exposes a HomeBlo
 tooling** (`fio`, `dd`, `mkfs`, `mount`) straight at the data path. The `homeblk_ublk` CLI brings up an instance,
 creates (or recovers) a volume, and serves its I/O on HomeBlocks' iomgr reactors via
 [ublkpp](https://github.com/eBay/ublkpp). It is built as part of the normal test build (ublkpp is a
-`test_requires`), landing at `build/Debug/src/test/homeblk_ublk`.
+`test_requires`), landing at `build/Debug/src/test/legacy_ublk/homeblk_ublk`.
 
 **Prerequisites:** a `ublk_drv`-capable kernel (≥ 5.19; `sudo modprobe ublk_drv` if `/dev/ublk-control` is
 missing) and **root** -- the control device is root-only.
@@ -303,7 +306,7 @@ missing) and **root** -- the control device is root-only.
 # Bring up HomeBlocks on a backing device and expose a 1 GiB volume.
 # --create_device makes the backing store a file of --dev_size_mb (handy for a quick try); omit it to use an
 # existing file or raw block device -- which HomeBlocks will FORMAT, destroying its current contents.
-sudo build/Debug/src/test/homeblk_ublk \
+sudo build/Debug/src/test/legacy_ublk/homeblk_ublk \
   --device /var/tmp/hb.dev --create_device --dev_size_mb 8192 \
   --vol_size_mb 1024 --data_chunk_size_mb 512 --index_chunk_size_mb 256 \
   --num_threads 4 -c
@@ -345,6 +348,19 @@ with the same `--vol_id` and **without** `--create_device`.
 > (`sudo modprobe brd rd_nr=1 rd_size=$((12*1024*1024))` → `--device /dev/ram0`, no `--create_device`). One fio
 > gotcha: `--verify` with `--numjobs>1` over a *shared* range reports false mismatches (writers overwrite each
 > other's blocks) -- give each job a disjoint `--offset_increment` region, or use a single writer.
+
+#### `craft_ublk`: the same trick for CRAFT
+
+`homeblk_ublk` drives a volume through the block API. A sibling CLI, `craft_ublk`
+(`build/Debug/src/test/craft/craft_ublk`), drives one through the **CRAFT** API instead -- login,
+dLSN-stamped broadcast writes, horizon reads -- against an N-replica set that lives entirely in process.
+It needs no backing device and no HomeStore, so `sudo craft_ublk --replicas 3` is enough to point `fio` at a
+quorum-replicated volume and watch the commit frontier advance over its REST endpoint.
+
+It exists to validate the client and its I/O path, not to measure anything: the in-process replica set stands in
+for a network, and its throughput is a property of that stand-in rather than of CRAFT. See
+[`src/test/craft/client/README.md`](src/test/craft/client/README.md) for the driver, the client, and what a real
+transport will have to provide.
 
 ## 📦 Dependencies
 

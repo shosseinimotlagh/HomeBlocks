@@ -340,7 +340,7 @@ lets ublkpp pre-reserve `async_io::_pool` per tag. So the tag space **is** the q
 flat `completion_slot[q_depth]`, the producer release-stores its `cqe_state*` into `slots[tag]`, and the
 single consumer acquire-exchanges it back out. No ring, no MPSC queue, no per-completion `std::function`
 allocation, no mutex. One wake drains a whole batch; the cost is an O(`q_depth`) scan of relaxed loads, which
-is 128 loads amortized over however many completions that wake carried.
+at ublkpp's default `--qdepth` of 128 is 128 loads amortized over however many completions that wake carried.
 
 Requirement 6 is the one to watch, because the shim currently **grants it for free** and that is a choice, not
 a fact. `MemTransport::take_payload` copies at issue, before any suspension, so today's client may recycle its
