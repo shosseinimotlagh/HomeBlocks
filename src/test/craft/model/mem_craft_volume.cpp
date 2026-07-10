@@ -24,11 +24,12 @@ volume_handle create_memory_volume(volume_info info, std::shared_ptr< MemCraftRe
     return std::make_shared< volume >(std::move(info), std::move(replica), volume::mem_craft_tag{});
 }
 
-MemReplicaHandles make_memory_replica_set(volume_info info, uint32_t n) {
-    auto group = make_mem_replica_group(info.id, n, static_cast< uint32_t >(info.page_size));
+MemReplicaHandles make_memory_replica_set(volume_info info, uint32_t n, std::size_t threads_per_replica) {
+    auto group = make_mem_replica_group(info.id, n, static_cast< uint32_t >(info.page_size), threads_per_replica);
 
     MemReplicaHandles out;
-    out.net = group.net;
+    // MOVE, not copy: otherwise `group`'s destructor would shut the transport down on the way out.
+    out.net = std::move(group.net);
     out.handles.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
         // One volume_handle per replica device -- the same shape create_volume yields per server.

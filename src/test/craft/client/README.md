@@ -324,6 +324,23 @@ anybody. A shim that comfortable teaches the client nothing.
 | 4 | A peer that **times out may still have applied** the write | Counting it as a deterministic reject resolves the slot `Empty` and advances `F` past a dLSN a replica later applies. Divergence. | `ClearingADelayLeavesAMissingSlotThatDrains` |
 | 5 | `REPLICA_DOWN` means **"I never delivered it"** | Only the transport can say that; a down server cannot answer for itself. It is what lets the client count it as a deterministic reject. | `N3_AllReplicasRefuseResolvesEmptyAndReleasesTheFrontier` |
 | 6 | **Either** serialize `data` before suspending, **or** signal when the send completes | The client acks at quorum with stragglers in flight, so the caller's buffer must outlive every *send* while only a quorum of *replies* is awaited. | `N3_StragglerWriteLandsIntactAfterTheClientReturned` |
+| 7 | The reply must be **reapable on the issuing queue's ring** | The ublk per-IO coroutine may only be resumed by its own queue thread (see #1: the client migrates coroutines by itself). If the transport cannot deliver its reply as a CQE on that queue's io_uring, the driver must bridge with an fd the queue already polls. | `CraftUblkDisk::queue_service` |
+
+Requirement 7 is what the driver is built around. `queue_service` parks a coroutine on `POLL_ADD` over the
+ublk queue's own ring, watching an eventfd; a CRAFT completion on any thread publishes its result into the
+IO's tag slot and kicks it. **The eventfd is the model's stand-in for a socket.** A real transport polls its
+connection fd in exactly that loop and parses the reply on the queue thread; it will still index its landing
+pad by request id, which is what a tag already is, so `craft_service_loop` does not change. This is also why
+`craft_ublk` needs no iomgr: ublkpp runs one OS thread per hardware queue over that queue's io_uring, and
+that is the whole runtime.
+
+The landing pad deserves a word, because it is the reason the driver takes no lock. A ublk tag is *"unique in
+queue wide"* and carries at most one IO, hence at most one completion, at a time — the same invariant that
+lets ublkpp pre-reserve `async_io::_pool` per tag. So the tag space **is** the queue: `queue_service` holds a
+flat `completion_slot[q_depth]`, the producer release-stores its `cqe_state*` into `slots[tag]`, and the
+single consumer acquire-exchanges it back out. No ring, no MPSC queue, no per-completion `std::function`
+allocation, no mutex. One wake drains a whole batch; the cost is an O(`q_depth`) scan of relaxed loads, which
+is 128 loads amortized over however many completions that wake carried.
 
 Requirement 6 is the one to watch, because the shim currently **grants it for free** and that is a choice, not
 a fact. `MemTransport::take_payload` copies at issue, before any suspension, so today's client may recycle its
@@ -376,14 +393,64 @@ replica -- which is precisely the seam a real transport will occupy.
   (nothing is). Fewer than `quorum` acks means the first cannot have fired, so the second did. The quorum
   path reads only the ack count. This is why the `Empty`-vs-`failed` decision, which needs every replica's
   error, lives on the sub-quorum path.
-* **A completion NEVER resumes on the issuing thread.** Every op suspends on a `sleep_event` that one of
-  `MemTransport`'s service threads completes, even at zero injected latency, because no real transport
-  delivers a reply inline with its submit. So the client's coroutine resumes on a service thread, and with
-  K > 1 of them the three replies to one broadcast land concurrently and out of order.
-  That chain ends in `run_craft_io` calling `iomanager.post_msg_ring()`, which needs a uring thread, so
-  `craft_ublk` injects a `completion_executor` that dispatches onto a worker reactor. The model itself stays
-  iomgr-free (a `std::function` hook), which is what keeps `test_craft_memory` linkable without HomeStore.
-  A real transport reaps its own CQEs on the queue thread that issued the IO and needs none of this.
+* **A completion NEVER resumes on the issuing thread.** Every op suspends on a `sleep_event` completed by one
+  of the addressed replica's own server threads, even at zero injected latency, because no real transport
+  delivers a reply inline with its submit. Each replica has its own pool (`--num_threads`, per replica), so it
+  may reply to two of its own requests out of order, and different replicas are independent. Reordering across
+  peers is what quorum depends on.
+* **The driver hands the result back to its own queue, never resumes it in place.** `run_craft_io` finishes on
+  whatever thread the CRAFT completion landed on, release-stores the result into that IO's
+  `queue_service::slots[tag]`, and kicks an eventfd. The queue's service-loop coroutine is parked on `POLL_ADD`
+  over the queue's own ring, so `run_queue_loop` resumes it *there* and the per-IO `cqe_state` is resumed on the
+  queue thread. It has to be: `resolve()` ends in `gate_.signal()`, which resumes a suspended reader inline on
+  the resolving thread, so a read issued on queue A can finish on queue B. Drain order is load-bearing —
+  `read(evfd)` **before** the slot scan, because a post that lands after the scan writes the level-triggered
+  eventfd after our read, and so re-arms the next `POLL_ADD`. Reading second would lose that wakeup.
+* **The driver's completion path takes no lock and allocates nothing.** `slots[tag]` is a single-producer /
+  single-consumer cell, and the tag guarantees no two producers ever pick the same one. The producer's
+  release-store of `state` publishes the plain `result` beside it; the consumer's acquire-exchange pairs with
+  it and claims the slot. The relaxed load that filters an empty slot is not a synchronization edge and does
+  not need to be, since it only ever decides whether to *skip*.
+
+### Where the locks are
+
+Nothing under `client/` declares a mutex. Every lock a 4 KiB write to three replicas touches lives in the
+**model**, and each one is standing in for something a real deployment does not do in-process:
+
+| lock | acquisitions per write | what it really is |
+|---|---|---|
+| `dlsn_tracker`, `craft_client`, `CraftUblkDisk` | **0** | — |
+| `StreamTracker`'s `shared_mutex` | 2, both *shared* | inside sisl; exclusive only on `truncate` (1-in-512) and on resize |
+| `MemTransport::mu_` | **0** | guards `by_id_`/`leader_`/`term_` only. Faults are read off a copy-on-write snapshot (`faults()`), so the IO path is two acquire loads |
+| `replica_service::mu` | 6 (post + pop, per replica) | the model's stand-in for a NIC. A real transport submits an SQE here |
+| `MemCraftReplica::mu_` | 3 (one journal insert each) | the *server*, on the far side of the wire. Not the client's cost |
+
+Both remaining entries are the shim's own bookkeeping, charged to the shim's threads, not the client's.
+
+### Do not benchmark the shim
+
+`craft_ublk`'s IOPS is a property of `MemTransport`, not of CRAFT. Quoting it as a CRAFT number is a category
+error, and "optimizing" it is worse: the shim's job is to *impose* a network hop and a serialization layer, so
+a shim that got fast would be a shim that stopped modelling the thing it exists to model.
+
+A zero-delay send costs a `make_shared<sleep_event>`, a `std::function` heap allocation, a `std::multimap`
+insert keyed on a `time_point` that is always *now*, a mutex, and a `notify_one` futex -- once per replica, on
+the issuing queue thread. A real transport's submit is a memcpy into the send buffer plus an SQE, with no
+syscall until the batch. **The shim overstates submit cost by roughly an order of magnitude.** That is the
+price of moving a request into another execution context in-process, where the "other machine" has to be a
+thread. The *shape* is right (a submit costs something, and it costs it on the issuing thread); the magnitude
+is not, and no design decision should be made from it.
+
+If you must measure, measure **CPU per IO** -- it does not care how many threads a design throws at the
+problem, which aggregate IOPS very much does. At 3 replicas, 4 KiB, QD32 this path costs roughly 33 us/IO and
+3.0 context switches per write, and 9.5 us/IO and 0.7 switches per read. The write figure of 3.01, which holds
+regardless of queue count, is the model: one wake per replica, three replicas, each request crossing into
+exactly one other execution context. Nothing else moves.
+
+Two traps. A single `fio` job submits from one CPU, so ublk steers all of its IO to **one** hw queue and
+`--nr_hw_queues` changes nothing; at QD32 you are reading `iops = 32 / latency` off a single queue thread. And
+the completion side already coalesces: under load the queue thread never sleeps, so N completions arriving
+between two `POLL_ADD`s cost one wake rather than N. Coalescing the eventfd kick would buy nothing.
 
 ## Observability: the craft_ublk REST endpoint
 

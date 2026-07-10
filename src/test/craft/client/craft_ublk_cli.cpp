@@ -15,8 +15,9 @@
 //
 // craft_ublk: a ublkpp_disk-style CLI that stands up an in-memory CRAFT replica set (a single replica
 // by default), logs a craft_client into it, and exposes it as a /dev/ublkbN block device via the
-// CraftUblkDisk adapter. Unlike homeblk_ublk it does NOT bring up HomeStore -- the CRAFT reference model
-// is HomeStore-free, so we only start iomgr (the ublk<->client completion bridge needs reactors).
+// CraftUblkDisk adapter. Unlike homeblk_ublk it brings up neither HomeStore NOR iomgr: the CRAFT model is
+// HomeStore-free, and CraftUblkDisk reaps its completions on the ublk queue's own io_uring, so the only
+// runtime is ublkpp's one-OS-thread-per-hardware-queue. The replicas' server threads live in MemTransport.
 //
 //   sudo ./craft_ublk --vol_size_mb 8192 --page_size 4096
 //   sudo ./craft_ublk --vol_size_mb 4096 --replicas 1 --num_threads 4
@@ -34,8 +35,6 @@
 #include <boost/uuid/random_generator.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/uuid_io.hpp>
-#include <iomgr/io_environment.hpp> // ioenvironment.with_iomgr
-#include <iomgr/iomgr.hpp>          // iomanager.stop
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 
@@ -60,7 +59,9 @@ SISL_OPTION_GROUP(craft_ublk,
                    ::cxxopts::value< uint32_t >()->default_value("1"), "<n>"),
                   (max_io_size_mb, "", "max_io_size_mb", "Largest single transfer in MB",
                    ::cxxopts::value< uint32_t >()->default_value("1"), "<mb>"),
-                  (num_threads, "", "num_threads", "iomgr reactor count",
+                  (num_threads, "", "num_threads",
+                   "Server threads PER REPLICA. Each replica is an independent server with its own pool, so "
+                   "--replicas 3 --num_threads 2 is six threads",
                    ::cxxopts::value< uint32_t >()->default_value("2"), "<n>"),
                   (device_id, "", "device_id", "ublk device id: -1 to assign, >=0 to recover a preserved device",
                    ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"),
@@ -122,9 +123,9 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, handle_signal);
     auto exit_future = s_stop_code.get_future();
 
-    // Start iomgr only (no HomeStore): the ublk queue<->client completion bridge runs on worker reactors.
+    // No iomgr, no HomeStore. ublkpp runs one OS thread per hardware queue over that queue's own io_uring,
+    // and CraftUblkDisk resumes its completions there; the replicas' server pools are MemTransport's.
     auto const num_threads = SISL_OPTIONS["num_threads"].as< uint32_t >();
-    ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = num_threads});
 
     auto const vid = (0 < SISL_OPTIONS.count("vol_id"))
         ? boost::uuids::string_generator()(SISL_OPTIONS["vol_id"].as< std::string >())
@@ -153,7 +154,7 @@ int main(int argc, char* argv[]) {
         // REST endpoint reports before handing it over.
         craft::volume_geometry geo{info.id, info.name, info.size_bytes, info.page_size};
 
-        auto set = craft::make_memory_replica_set(std::move(info), replicas);
+        auto set = craft::make_memory_replica_set(std::move(info), replicas, num_threads);
         auto mem_replicas = set.replicas; // observability handles; see MemReplicaHandles
         auto net = set.net;
 
@@ -164,21 +165,11 @@ int main(int argc, char* argv[]) {
             LOGINFO("CRAFT transport op timeout: {} ms", t);
         }
 
-        // The model completes every op on one of its own service threads, because that is what a network
-        // does and the client must be correct under it. Those threads are not iomgr reactors, though, and
-        // the completion chain ends in post_msg_ring() on the ublk queue ring, which needs a uring thread.
-        // Dispatch completions onto a worker reactor so the fast path stays; the model stays iomgr-free.
-        // A real transport reaps its own CQEs on the issuing queue thread and needs none of this.
-        net->set_completion_executor([](std::function< void() > fn) {
-            iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [f = std::move(fn)]() mutable { f(); });
-        });
-
         auto client = std::make_shared< craft::craft_client >(std::move(set.handles), 0, max_inflight);
 
         auto login_res = detail::sync_get(client->login(random_token()));
         if (!login_res) {
             LOGERROR("CRAFT login failed: {}", login_res.error().message());
-            iomanager.stop();
             return EIO;
         }
         LOGINFO("CRAFT login ok: {} replica(s), term={}, lba_size={}", replicas, client->term(), client->lba_size());
@@ -213,7 +204,5 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    LOGINFO("Stopping iomgr");
-    iomanager.stop();
     return rc;
 }

@@ -54,16 +54,16 @@ async_status MemCraftReplica::logout(client_hdr hdr) {
 // imposes latency. What is left below is the server: journal + index. Nothing here copies bytes.
 async_status MemCraftReplica::write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list data) {
     if (!net_) co_return fail(craft_error::NO_QUORUM); // no wire, nothing to deliver over
-    co_return co_await net_->send_write(this, hdr, dlsn, addr, len, std::move(data));
+    co_return co_await net_->send_write(shared_from_this(), hdr, dlsn, addr, len, std::move(data));
 }
 async_result< std::vector< io_extent > > MemCraftReplica::read(client_hdr hdr, int64_t read_lsn, uint64_t addr,
                                                                uint64_t len, sisl::sg_list dest) {
     if (!net_) co_return fail(craft_error::NO_QUORUM);
-    co_return co_await net_->send_read(this, hdr, read_lsn, addr, len, std::move(dest));
+    co_return co_await net_->send_read(shared_from_this(), hdr, read_lsn, addr, len, std::move(dest));
 }
 async_result< LSNPair > MemCraftReplica::keep_alive(client_hdr hdr) {
     if (!net_) co_return fail(craft_error::NO_QUORUM);
-    co_return co_await net_->send_keep_alive(this, hdr);
+    co_return co_await net_->send_keep_alive(shared_from_this(), hdr);
 }
 async_result< LSNPair > MemCraftReplica::get_lsns() { co_return do_lsns(); }
 async_result< LSNPair > MemCraftReplica::get_rs_commit_lsn() { co_return do_lsns(); }

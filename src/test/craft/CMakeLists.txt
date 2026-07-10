@@ -128,9 +128,10 @@ if (UblkPP_FOUND)
         UblkPP::UblkPP
     )
 
-    # CLI: stands up an in-memory replica set, logs a craft_client in, exposes it as /dev/ublkbN. No
-    # HomeStore -- only iomgr (for the ublk<->client completion bridge). Compiles mem_craft_volume.cpp +
-    # the model objects directly (as test_craft_e2e does).
+    # CLI: stands up an in-memory replica set, logs a craft_client in, exposes it as /dev/ublkbN. No HomeStore
+    # and no iomgr runtime -- ublkpp runs one OS thread per hw queue over that queue's own io_uring, and the
+    # replica pools are plain threads. Compiles mem_craft_volume.cpp + the model objects directly (as
+    # test_craft_e2e does).
     add_executable(craft_ublk)
     target_sources(craft_ublk PRIVATE
         client/craft_ublk_cli.cpp

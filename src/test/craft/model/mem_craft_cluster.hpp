@@ -23,8 +23,10 @@
 // Membership, replica count, leader, and fault injection are control-plane / orchestration concerns
 // that sit OUTSIDE the CRAFT protocol -- here they are just wired up directly (a CLI flag / harness).
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -46,10 +48,48 @@ namespace homeblocks::craft {
 
 using uuid_hash = boost::hash< peer_id_t >;
 
+// Every fault and latency knob, in one immutable snapshot. The IO path reads it with a single acquire load of
+// a pointer and takes NO lock: is_up / write_allowed / delay_for / op_timeout are consulted several times per
+// replica per IO, and routing all of that through one mutex made it the hottest lock in the model (fifteen
+// acquisitions of a single global mutex per 4 KiB write to three replicas).
+//
+// Mutation is copy-on-write, serialized by MemTransport::fault_mu_ and confined to control paths: tests, the
+// CLI, and the REST delay route. A superseded snapshot is RETIRED, never freed, so an op holding a pointer to
+// it mid-flight can never dangle. Retention is O(number of fault changes), which is tiny by construction.
+struct fault_state {
+    std::unordered_set< peer_id_t, uuid_hash > down;
+    std::optional< std::unordered_set< peer_id_t, uuid_hash > > write_keep;
+    std::unordered_map< peer_id_t, std::chrono::milliseconds, uuid_hash > delays;
+    std::chrono::milliseconds op_timeout{0};
+
+    bool is_up(peer_id_t id) const { return !down.contains(id); }
+    bool write_allowed(peer_id_t id) const {
+        if (down.contains(id)) return false;
+        if (write_keep && !write_keep->contains(id)) return false;
+        return true;
+    }
+    std::chrono::milliseconds delay_for(peer_id_t id) const {
+        auto const it = delays.find(id);
+        return (it == delays.end()) ? std::chrono::milliseconds{0} : it->second;
+    }
+};
+
 class MemTransport {
 public:
-    MemTransport(std::vector< replica_endpoint > members, uint32_t lba_size);
-    ~MemTransport(); // stops the timer thread; pending late deliveries are dropped
+    // `threads_per_replica` sizes EACH replica's server pool, not a shared one: three replicas at 2 threads
+    // is six threads, three independent servers. See replica_service below.
+    MemTransport(std::vector< replica_endpoint > members, uint32_t lba_size, std::size_t threads_per_replica = 2);
+    ~MemTransport();
+
+    // Join every replica's server pool and drain what is queued. Idempotent.
+    //
+    // MUST be called by an owner, on a thread that is NOT one of the pools -- MemReplicaGroup and
+    // MemReplicaHandles do it in their destructors. It cannot be left to ~MemTransport: an in-flight op holds
+    // a shared_ptr to its replica, which holds a shared_ptr to us, so the LAST reference is routinely dropped
+    // by a straggler finishing on a server thread. ~MemTransport would then try to join the thread it is
+    // running on ("Resource deadlock avoided"). Once shutdown() has run, ~MemTransport is a no-op wherever it
+    // lands.
+    void shutdown();
 
     // Called by create_memory_volume / make_mem_replica_group as each replica is built.
     void register_replica(MemCraftReplica* r);
@@ -66,11 +106,18 @@ public:
     //   * imposes latency (set_delay) and the deadline (set_op_timeout).
     //
     // What survives is the replica's do_write / do_read / do_keep_alive: the journal and the LBA index.
-    async_status send_write(MemCraftReplica* to, client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
-                            sisl::sg_list data);
-    async_result< std::vector< io_extent > > send_read(MemCraftReplica* to, client_hdr hdr, int64_t read_lsn,
-                                                       uint64_t addr, uint64_t len, sisl::sg_list dest);
-    async_result< LSNPair > send_keep_alive(MemCraftReplica* to, client_hdr hdr);
+    //
+    // `to` is a shared_ptr, by value, so it lives in the op's coroutine frame for the op's whole life. It has
+    // to: the client acks at QUORUM and leaves stragglers in flight, and one of those may still be applying a
+    // write long after its replica's last other owner is gone. An in-flight request keeps its server alive.
+    // (No cycle: the frame is transient. The transport itself never holds a strong ref to a replica -- see the
+    // weak_from_this() in send_write's late-delivery closure.)
+    async_status send_write(std::shared_ptr< MemCraftReplica > to, client_hdr hdr, int64_t dlsn, uint64_t addr,
+                            uint64_t len, sisl::sg_list data);
+    async_result< std::vector< io_extent > > send_read(std::shared_ptr< MemCraftReplica > to, client_hdr hdr,
+                                                       int64_t read_lsn, uint64_t addr, uint64_t len,
+                                                       sisl::sg_list dest);
+    async_result< LSNPair > send_keep_alive(std::shared_ptr< MemCraftReplica > to, client_hdr hdr);
 
     // ── cold path: leader-only orchestration ──
     // login: GetRSCommitLSN -> SyncRSCommitLSN -> InternalLogin. A non-leader returns LoginResult with
@@ -83,9 +130,18 @@ public:
 
     // ── membership / routing (consulted by the replicas' client-facing ops) ──
     peer_id_t leader() const;
-    bool is_up(peer_id_t id) const;
-    bool write_allowed(peer_id_t id) const; // false => this write is dropped (sub-quorum)
     std::size_t member_count() const { return members_.size(); }
+
+    // The IO path's view of the fault/latency state: one acquire load, no lock. Hold the returned pointer for
+    // the whole of one op so its checks see a consistent snapshot (a superseded one is retired, never freed).
+    fault_state const* faults() const { return faults_.load(std::memory_order_acquire); }
+
+    // Convenience wrappers for control paths (the REST endpoint, the cold path, tests). Each loads the
+    // snapshot itself; on the IO path prefer faults() once and query it directly.
+    bool is_up(peer_id_t id) const { return faults()->is_up(id); }
+    bool write_allowed(peer_id_t id) const { return faults()->write_allowed(id); } // false => sub-quorum drop
+    std::chrono::milliseconds delay_for(peer_id_t id) const { return faults()->delay_for(id); }
+    std::chrono::milliseconds op_timeout() const { return faults()->op_timeout; }
 
     // ── fault injection (tests / CLI) ──
     void set_up(peer_id_t id, bool up);                  // bring a replica down / back up
@@ -104,22 +160,16 @@ public:
     // A CONSTANT delay only produces uniform lag: the straggler's journal fills in order, just late, so
     // missing_count stays 0. Changing the delay while writes are in flight is what reorders arrivals.
     void set_delay(peer_id_t id, std::chrono::milliseconds d); // 0 removes the delay
-    std::chrono::milliseconds delay_for(peer_id_t id) const;
 
     // How long the transport waits before abandoning an op. 0 (the default) means wait forever, which is
     // the model's original behavior: without it a delay merely slows the client down.
     void set_op_timeout(std::chrono::milliseconds t);
-    std::chrono::milliseconds op_timeout() const;
-
-    // Where a completion runs. Unset (the default) means "on one of the service threads", which is the
-    // adversarial model: an arbitrary thread, unrelated to the issuer. craft_ublk injects an executor that
-    // dispatches onto an iomgr worker reactor so its post_msg_ring completion stays on a uring thread.
-    // A real transport reaps its own CQEs, so this hook has no production analog; it exists so the model
-    // can stay iomgr-free while the driver above it is not.
-    using completion_executor = std::function< void(std::function< void() >) >;
-    void set_completion_executor(completion_executor ex);
 
 private:
+    // Copy-on-write: build the successor under fault_mu_, retire it so readers of the old one stay valid,
+    // then publish with a release store. Only control paths call this.
+    template < class Fn >
+    void mutate_faults(Fn&& fn);
     // What a suspended op resumes on. Single-shot and completed from a service thread; the awaiting
     // coroutine resumes there, which is why nothing here may hold mu_ across a co_await.
     using sleep_event = sisl::async::shared_awaitable< std::monostate >;
@@ -131,49 +181,65 @@ private:
         std::chrono::milliseconds deliver{0};
         bool timed_out{false};
     };
-    delivery plan_delivery(peer_id_t id) const;
+    static delivery plan_delivery(fault_state const* f, peer_id_t id);
 
-    // Suspend the caller for `d` and resume it on a service thread. `d == 0` still hops: a completion is
-    // NEVER inline with its submit, because no real transport delivers one that way. Callers must therefore
-    // treat every op as suspending.
-    std::shared_ptr< sleep_event > after(std::chrono::milliseconds d);
-    // Run `fn` on a service thread after `d`; false if the transport is shutting down and `fn` was dropped.
+    // Suspend the caller for `d` and resume it on one of `id`'s server threads. `d == 0` still hops: a
+    // completion is NEVER inline with its submit, because no real transport delivers one that way. Callers
+    // must therefore treat every op as suspending.
+    std::shared_ptr< sleep_event > after(std::chrono::milliseconds d, peer_id_t id);
+    // Run `fn` on one of `id`'s server threads after `d`; false if we are shutting down and `fn` was dropped.
     // Used for the late delivery of a timed-out write. `fn` must NOT capture a shared_ptr to a replica:
     // replicas hold a shared_ptr to this transport, so that would close a reference cycle. Capture
     // weak_from_this() and lock it.
-    bool run_after(std::chrono::milliseconds d, std::function< void() > fn);
+    bool run_after(std::chrono::milliseconds d, peer_id_t id, std::function< void() > fn);
 
     std::vector< MemCraftReplica* > live_replicas_locked() const; // requires mu_ held
     static std::size_t quorum(std::size_t n) { return n / 2 + 1; }
 
-    void ensure_service(); // lazily spawn the service threads on first use; requires tmu_ held
-    void service_loop();
+    using clock = std::chrono::steady_clock;
 
-    std::vector< replica_endpoint > members_;
+    // One replica's server: its own deadline queue and its own thread pool. Each replica is an INDEPENDENT
+    // server, so it may complete and reply out of order with itself (threads > 1, which is what a real server
+    // processing concurrently does), while replicas stay independent of each other. Reordering ACROSS peers
+    // is what quorum depends on; a shim that funnelled every replica through one pool would model neither.
+    //
+    // Each pool has its own lock, never taken while mu_ is held (and vice versa): a dispatched item re-enters
+    // the replica, which re-enters mu_ via is_up() / write_allowed().
+    struct replica_service {
+        std::multimap< clock::time_point, std::function< void() > > timers;
+        std::vector< std::thread > threads;
+        std::condition_variable cv;
+        std::mutex mu;
+        bool stop{false};
+    };
+    replica_service* service_for(peer_id_t id); // null only if `id` is not a member
+    // Spawned eagerly, from the ctor, on the owner's thread: a std::thread must never be created on the IO
+    // path, where it would land on the caller's ublk queue thread (and inherit that queue's comm name, making
+    // a thread census unreadable). A real transport likewise establishes its connections, and the completion
+    // machinery behind them, at setup.
+    void start_service(replica_service& s, std::size_t replica_idx);
+    void service_loop(replica_service& s);
+    std::atomic< bool > stopped_{false};
+
+    std::vector< replica_endpoint > members_; // const after the ctor
     std::unordered_map< peer_id_t, MemCraftReplica*, uuid_hash > by_id_;
     peer_id_t leader_{};
     uint64_t term_{0};
     uint32_t lba_size_{0}; // volume block size (bytes)
-    std::unordered_set< peer_id_t, uuid_hash > down_;
-    std::optional< std::unordered_set< peer_id_t, uuid_hash > > write_keep_;
-    std::unordered_map< peer_id_t, std::chrono::milliseconds, uuid_hash > delays_;
-    std::chrono::milliseconds op_timeout_{0};
+    // Guards ONLY by_id_ / leader_ / term_, all of which are cold-path (register_replica, run_login,
+    // run_logout, set_leader). The IO path never takes it.
     mutable std::mutex mu_;
 
-    // The service threads: this model's stand-in for a network completion path. Deadline-ordered queue, K
-    // threads popping due items. K > 1 on purpose -- it is what makes replies to one broadcast land out of
-    // order and on different threads, which no single-threaded shim would ever exercise.
-    //
-    // Its own lock, never taken while mu_ is held (and vice versa): a dispatched item re-enters the replica,
-    // which re-enters mu_ via is_up() / write_allowed().
-    static constexpr std::size_t k_service_threads = 2;
-    using clock = std::chrono::steady_clock;
-    std::multimap< clock::time_point, std::function< void() > > timers_;
-    std::vector< std::thread > service_threads_;
-    completion_executor exec_; // guarded by tmu_; set once before IO starts
-    std::condition_variable tcv_;
-    mutable std::mutex tmu_;
-    bool service_stop_{false};
+    // The IO path's fault/latency view. `faults_` is the published snapshot; `retired_` owns every snapshot
+    // ever published, so a reader can hold a raw pointer across a suspension without a refcount.
+    std::atomic< fault_state const* > faults_{nullptr};
+    std::mutex fault_mu_;                                         // serializes mutators only
+    std::vector< std::unique_ptr< fault_state const > > retired_; // guarded by fault_mu_
+
+    // Built once in the ctor from members_ and never rehashed, so a replica_service* stays stable and the
+    // per-pool locks need no protection from mu_.
+    std::size_t threads_per_replica_;
+    std::unordered_map< peer_id_t, std::unique_ptr< replica_service >, uuid_hash > services_;
 };
 
 // An N-replica in-process group with NO volumes attached -- the model layer used directly by unit
@@ -182,8 +248,21 @@ private:
 struct MemReplicaGroup {
     std::shared_ptr< MemTransport > net;
     std::vector< std::shared_ptr< MemCraftReplica > > replicas; // index 0 is the default leader
+
+    MemReplicaGroup() = default;
+    MemReplicaGroup(MemReplicaGroup&&) = default;
+    MemReplicaGroup& operator=(MemReplicaGroup&&) = default;
+    MemReplicaGroup(MemReplicaGroup const&) = delete;
+    MemReplicaGroup& operator=(MemReplicaGroup const&) = delete;
+    // Join the server pools while we still own everything, so no straggler is left running on a replica we
+    // are about to destroy -- and so ~MemTransport never lands on one of its own threads. A moved-from group
+    // has a null `net` and does nothing.
+    ~MemReplicaGroup() {
+        if (net) net->shutdown();
+    }
 };
-MemReplicaGroup make_mem_replica_group(volume_id_t vol_id, uint32_t n = 3, uint32_t page_size = 4096);
+MemReplicaGroup make_mem_replica_group(volume_id_t vol_id, uint32_t n = 3, uint32_t page_size = 4096,
+                                       std::size_t threads_per_replica = 2);
 
 // Deterministic per-replica id derived from the volume id + index (so tests are reproducible).
 peer_id_t mem_replica_id(volume_id_t vol_id, uint32_t index);

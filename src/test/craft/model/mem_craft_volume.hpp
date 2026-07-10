@@ -23,6 +23,7 @@
 // This is a test-local header (src/test/craft/model): it pulls in volume.hpp, so a TU using it links HomeStore.
 // The model itself (mem_craft_replica/cluster) stays HomeStore-free and is testable on its own.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -49,7 +50,20 @@ struct MemReplicaHandles {
     // REST endpoint reads their stats(). Nothing on the CRAFT protocol path may use this; a client only ever
     // sees the opaque handles above.
     std::vector< std::shared_ptr< MemCraftReplica > > replicas;
+
+    MemReplicaHandles() = default;
+    MemReplicaHandles(MemReplicaHandles&&) = default;
+    MemReplicaHandles& operator=(MemReplicaHandles&&) = default;
+    MemReplicaHandles(MemReplicaHandles const&) = delete;
+    MemReplicaHandles& operator=(MemReplicaHandles const&) = delete;
+    // See MemTransport::shutdown(): join the pools while we still own the replicas. A moved-from handle set
+    // has a null `net` and does nothing.
+    ~MemReplicaHandles() {
+        if (net) net->shutdown();
+    }
 };
-MemReplicaHandles make_memory_replica_set(volume_info info, uint32_t n = 3);
+// `threads_per_replica` sizes EACH replica's server pool (see MemTransport): every replica is an
+// independent server, so three replicas at 2 threads is six threads, not two.
+MemReplicaHandles make_memory_replica_set(volume_info info, uint32_t n = 3, std::size_t threads_per_replica = 2);
 
 } // namespace homeblocks::craft
