@@ -21,56 +21,69 @@
 // replica that missed a SUFFIX of writes has last_append_lsn frozen and does not know the write exists).
 //
 // It is the SAME overlay a replica uses to route a read between its journal-tail and its applied index,
-// generalized from 2 tiers on one node to N members, and it is deliberately the SIBLING of dlsn_tracker:
-// both are a sisl::StreamTracker keyed by dLSN with a per-member concept layered on top.
+// generalized from 2 tiers on one node to N members. TWO TIERS split at the commit frontier `folded`:
 //
 //   server (one node)                          client (read_route_map, N members)
-//   ---------------------------------          -------------------------------------------------
-//   journal-tail overlay (commit_lsn, H]  ->   per-dLSN HOLDER BITSET over (folded, Ha]   sparse, recent
-//   applied index        (<= commit_lsn)  ->   per-member FLOOR (<= folded)               dense base
-//   route: journal vs index by max D<=H   ->   route: WHICH members hold the max acked D<=H
+//   ---------------------------------          -------------------------------------------------------
+//   journal-tail overlay (commit_lsn, H]  ->   ABOVE folded: per-dLSN HOLDER BITSET (sisl::StreamTracker)
+//   applied index        (<= commit_lsn)  ->   BELOW folded: per-member LBA-range MISSING MAP (boost::icl)
+//   route: journal vs index by max D<=H   ->   route: WHICH members hold every winner <= H over the range
 //
-// The floor is stored inversely as `first_miss[i]` -- the LOWEST dLSN member i is known to have missed
-// (kNever if it has missed nothing). Member i is caught up to the frontier iff first_miss[i] > folded. This
-// inversion is what makes the structure lock-free: first_miss is advanced by fetch_min, which is commutative
-// and idempotent, so concurrent folds and re-application are trivially correct -- no per-member CAS loop, no
-// sequential "contiguous floor" pass. first_miss[i] is exactly the client's model of member i's commit_lsn
-// boundary (below it, i has everything), read across the wire.
+// ABOVE `folded` (the live (folded, Ha] window): the StreamTracker overlay carries, per dLSN, the holder
+// bitset. Its per-write updates are allocation-free bit-ORs, which is why we keep it for the churny recent
+// window rather than folding everything into one interval map. It also handles the horizon clamp and
+// stragglers precisely (a not-yet-acked member is simply not in the holder set).
 //
-// FOLD ON COMPLETION. A dLSN is collapsed into the floors only once EVERY replica op for it has completed --
-// StreamTracker's completed bit, which the processor sets when the per-member `completed` mask fills. Folding
-// the instant the frontier passed it would race a healthy straggler: a member that acks a microsecond after
-// quorum would look like a miss and be stuck behind. The misses are recorded IN the completion processor,
-// when `completed == all_mask`, reading `holders` under seq_cst so every acking member's bit is already
-// visible -- so a slow-but-healthy member records no miss, and fold itself never reads holders.
+// BELOW `folded`: a per-member boost::icl::interval_map keyed by BYTE range. This is the CRAFT design's
+// "per-replica Missing map" (docs/craft/rpcs.md:82-83: an eligible replica has "no Missing slot <= H
+// overlapping the range"). eligible() below the frontier is one LBA-overlap query -- so a member missing
+// block X still serves reads of block Y. That is the whole point: the old scalar excluded a member from ALL
+// sub-frontier reads once it missed anything, which for N=3 could make a read of a block ALL members hold
+// return NOT_ELIGIBLE.
 //
-// CONCURRENCY. record_completion() runs from arbitrary server threads (detached when_quorum children) while
-// the client thread(s) fold and route. The ONLY lock is StreamTracker's own shared_mutex -- shared for
-// update/foreach/completed_upto, exclusive only on truncate/resize -- exactly the tracker's profile. The
-// per-member floors (first_miss) and the folded frontier are plain atomics. There is no bespoke lock.
+// FOLD IS ASCENDING. A missed write is applied to the interval map only on fold, in ascending dLSN order,
+// because clear-on-supersede is order-sensitive: "member holds the LATEST folded write on this block ->
+// erase; missed it -> set". Folds are contiguous ascending (F advances over the resolved prefix), so per LBA
+// the map ends reflecting the highest folded winner. record_completion cannot do this (it fires in
+// completion order), so a non-universal completed slot is handed to fold via `pending_`. Universal (all-ack)
+// and Empty (no-ack) and sub-quorum (never a winner) slots hand off nothing -> healthy writes touch no
+// interval map, and a healthy fold is lock-free (an atomic frontier advance gated by `pending_hint_`).
 //
-// BOUNDING. Healthy, every write reaches all members, records no miss, and its slot is batch-truncated once
-// folded. A missed write's slot folds once complete (a down/refusing member completes immediately, so it
-// folds promptly even under a sustained fault); its miss lives on in first_miss, O(N). What is not reclaimed
-// without the deferred commit_lsn recovery is a member that missed a write and later resynced: the client
-// never sees an ack, so first_miss stays low and it is over-avoided (safe, never stale) until re-login.
+// CONCURRENCY. The interval maps are guarded by a std::shared_mutex `map_mu_`: eligible() takes it shared,
+// the fold apply takes it exclusive (fault-only -- healthy folds never touch it). `pending_`/`pending_hint_`
+// carry misses from the completion threads to the fold; `fold_mu_` serializes the fault-path fold so the
+// apply stays ascending. The overlay keeps its own StreamTracker shared_mutex. So a healthy read is:
+// lock-free frontier advance + shared map query (empty map) + shared overlay scan.
+//
+// BOUNDING. The map is bounded by each member's coalesced missing byte coverage (icl merges adjacent
+// ranges), cleared by supersede (a later folded write it holds) and by the deferred commit_lsn recovery
+// (advance_synced), reset on re-login. A member that missed a never-rewritten block stays over-avoided
+// (safe, never stale) until recovery/re-login.
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
+#include <utility>
+#include <vector>
+
+#include <boost/icl/interval.hpp>
+#include <boost/icl/interval_map.hpp>
 
 #include <sisl/fds/stream_tracker.hpp>
 
 namespace homeblocks::craft {
 
-// One overlay slot per dLSN. `dlsn` is carried so the completion processor -- which StreamTracker hands only
-// the slot, not its index -- can record a miss against first_miss. Trivially copyable: StreamTracker callocs
-// the slot array and memmoves it on compaction (under its unique lock, so never against a live reader).
+// One overlay slot per dLSN, above the frontier. `dlsn`/`addr`/`len` are carried so fold, which drains a
+// completed slot's miss, is self-contained. Trivially copyable: StreamTracker callocs the slot array and
+// memmoves it on compaction (under its unique lock, so never against a live reader).
 struct route_slot {
     int64_t dlsn{-1};
     uint64_t addr{0};
@@ -80,16 +93,41 @@ struct route_slot {
 };
 
 class read_route_map {
+    // A durable-but-non-universal completed slot handed from a completion thread to the fold. Self-contained
+    // so fold never re-reads the (possibly truncated) overlay slot.
+    struct pending_miss {
+        int64_t dlsn;
+        uint64_t held;
+        uint64_t addr;
+        uint64_t len;
+    };
+    // key = byte offset; value = the dLSN the member is known to miss on that range (only the deferred
+    // recovery reads the value). partial_enricher (not the default absorber) so a segment whose value is
+    // dLSN 0 -- the very first write after a fresh login -- is retained rather than absorbed as the identity.
+    using missing_map = boost::icl::interval_map< uint64_t, int64_t, boost::icl::partial_enricher >;
+
 public:
     // (Re-)seed for a session of `n` members with login dLSN `L`. The login SyncRSCommitLSN barrier synced
-    // the live members at L, so everything <= L is universally held: no member has missed anything, and the
-    // overlay starts at L+1. n must be in [1, 64] (the holder set is a uint64 bitset); real sets are 3/5/7.
+    // the live members at L, so everything <= L is universally held: no member is missing anything, the
+    // overlay starts at L+1, and each member's Synced baseline is L. n must be in [1, 64] (bitset).
     void reset(std::size_t n, int64_t login_dlsn) {
+        assert(n >= 1 && n <= k_max_members); // real CRAFT replica sets are 3/5/7/9
         n_ = n;
         quorum_ = n / 2 + 1;
         all_mask_ = mask_of(n);
+        login_dlsn_ = login_dlsn;
+        {
+            std::unique_lock< std::shared_mutex > g{map_mu_};
+            for (std::size_t i = 0; i < n; ++i)
+                miss_[i].clear();
+        }
         for (std::size_t i = 0; i < n; ++i)
-            first_miss_[i].store(kNever, std::memory_order_relaxed);
+            synced_[i].store(login_dlsn, std::memory_order_relaxed);
+        {
+            std::lock_guard< std::mutex > g{pending_mu_};
+            pending_.clear();
+        }
+        pending_hint_.store(kNever, std::memory_order_relaxed);
         folded_.store(login_dlsn, std::memory_order_relaxed);
         last_trunc_.store(login_dlsn, std::memory_order_relaxed);
         overlay_.emplace("craft_route", login_dlsn); // base becomes login_dlsn + 1
@@ -100,63 +138,107 @@ public:
     void create(int64_t d, uint64_t addr, uint64_t len) { overlay_->create(d, route_slot{d, addr, len, 0, 0}); }
 
     // One replica op for dLSN `d` completed on member `idx`: `acked` iff it holds the write (a timeout /
-    // REPLICA_DOWN / STALE_TERM completes acked=false and is NOT evidence of a hold). Called from the
-    // when_quorum hook for every child, on arbitrary threads. When the last member completes, the misses for
-    // this dLSN are finalized here (see the header note on ordering) and the StreamTracker completed bit is
-    // set, which is what fold keys on.
+    // REPLICA_DOWN / STALE_TERM completes acked=false). Called from the when_quorum hook for every child, on
+    // arbitrary threads. On the last completer, a DURABLE (quorum-acked) but non-universal slot is handed to
+    // the fold via pending_ (fold applies it to the interval map in ascending order); the completed bit it
+    // sets is what fold keys on -- and the pending push happens BEFORE that bit, so a fold that later sees
+    // this dLSN complete is guaranteed to see the pending entry.
     void record_completion(int64_t d, std::size_t idx, bool acked) {
         uint64_t const b = bit(idx);
         overlay_->update(d, [this, b, acked](route_slot& s) -> bool {
             if (acked) std::atomic_ref< uint64_t >(s.holders).fetch_or(b, std::memory_order_seq_cst);
             uint64_t const nc = std::atomic_ref< uint64_t >(s.completed).fetch_or(b, std::memory_order_seq_cst) | b;
             if (nc != all_mask_) return false;
-            // Last completer: all acking members' holder bits are already visible (each set before its
-            // completed bit, seq_cst). A complete slot with no holders is an Empty no-op -- everyone serves
-            // it as a hole -- so it is nobody's miss.
+            // Last completer: all acking members' holder bits are visible (each set before its completed bit,
+            // seq_cst). Hand off only a DURABLE (>= quorum) slot that someone missed: a sub-quorum / Empty
+            // (< quorum) slot is never a winner and never folds below F, and a universal slot is nobody's miss.
             uint64_t const held = std::atomic_ref< uint64_t >(s.holders).load(std::memory_order_seq_cst);
-            uint64_t const missers = (held == 0) ? 0 : (all_mask_ & ~held);
-            for (std::size_t i = 0; i < n_; ++i)
-                if (missers & bit(i)) fetch_min(first_miss_[i], s.dlsn);
+            if (static_cast< std::size_t >(std::popcount(held)) >= quorum_ && held != all_mask_) {
+                std::lock_guard< std::mutex > g{pending_mu_};
+                pending_.push_back(pending_miss{s.dlsn, held, s.addr, s.len});
+                int64_t h = pending_hint_.load(std::memory_order_relaxed);
+                while (s.dlsn < h &&
+                       !pending_hint_.compare_exchange_weak(h, s.dlsn, std::memory_order_release,
+                                                            std::memory_order_relaxed)) {}
+            }
             return true; // set StreamTracker's completed bit for this dLSN
         });
     }
 
-    // Advance the folded frontier toward F, but only over the contiguous ALL-COMPLETE prefix (so a
-    // not-yet-complete straggler stalls it -- correct, since its misses are not finalized). Misses are
-    // already in first_miss, so fold only moves the frontier and batch-truncates the collapsed slots.
+    // Advance the folded frontier toward F over the contiguous ALL-COMPLETE prefix, applying any pending
+    // misses <= the new frontier to the interval maps. Healthy fast path (no pending miss <= target) is
+    // lock-free: it just advances the atomic frontier and batch-truncates.
     void fold_to(int64_t F) {
-        int64_t const cur = folded_.load(std::memory_order_acquire);
+        int64_t cur = folded_.load(std::memory_order_acquire);
         if (F <= cur) return;
-        int64_t const target = std::min(F, overlay_->completed_upto(cur + 1));
+        int64_t target = std::min(F, overlay_->completed_upto(cur + 1));
         if (target <= cur) return;
 
-        int64_t exp = cur; // monotonic; a losing CAS just means another thread advanced it further
-        while (exp < target &&
-               !folded_.compare_exchange_weak(exp, target, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
-
-        // Truncate in batches, gated so exactly one thread reclaims per batch -- truncate takes the
-        // StreamTracker's UNIQUE lock, so doing it every fold would serialize the shared-lock readers.
-        int64_t lt = last_trunc_.load(std::memory_order_relaxed);
-        if ((target - lt >= k_trunc_batch) &&
-            last_trunc_.compare_exchange_strong(lt, target, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            overlay_->truncate(target);
+        // pending_hint_ is a conservative lower bound on the min pending dLSN (fetch_min on push, ordered
+        // before the completed bit). If it is above target, nothing <= target needs the map -> lock-free.
+        if (pending_hint_.load(std::memory_order_acquire) > target) {
+            advance_folded(target);
+            maybe_truncate(target);
+            return;
         }
+
+        // Slow (fault) path: serialize so the interval-map apply stays ascending across concurrent folds.
+        std::lock_guard< std::mutex > fg{fold_mu_};
+        cur = folded_.load(std::memory_order_acquire);
+        target = std::min(F, overlay_->completed_upto(cur + 1));
+        if (target <= cur) return;
+
+        std::vector< pending_miss > batch;
+        {
+            std::lock_guard< std::mutex > pg{pending_mu_};
+            int64_t new_hint = kNever;
+            std::vector< pending_miss > keep;
+            keep.reserve(pending_.size());
+            for (auto const& e : pending_) {
+                if (e.dlsn <= target) {
+                    batch.push_back(e);
+                } else {
+                    keep.push_back(e);
+                    new_hint = std::min(new_hint, e.dlsn);
+                }
+            }
+            pending_.swap(keep);
+            pending_hint_.store(new_hint, std::memory_order_release);
+        }
+
+        if (!batch.empty()) {
+            std::sort(batch.begin(), batch.end(),
+                      [](pending_miss const& x, pending_miss const& y) { return x.dlsn < y.dlsn; });
+            std::unique_lock< std::shared_mutex > mg{map_mu_};
+            for (auto const& e : batch) {
+                auto const iv = byte_ivl(e.addr, e.len);
+                for (std::size_t i = 0; i < n_; ++i) {
+                    if (e.held & bit(i))
+                        miss_[i].erase(iv); // holds the latest folded write on this range -> not missing
+                    else
+                        miss_[i].set(std::make_pair(iv, e.dlsn)); // missed it -> missing there
+                }
+            }
+        }
+        advance_folded(target); // frontier AFTER the map is applied...
+        maybe_truncate(target); // ...and the overlay slot is dropped only after that, so no dLSN is ever
+                                // in neither tier (eligible's intersects scans the whole map anyway).
     }
 
     // Is member `idx` eligible to serve a read of [addr,len) whose highest segment horizon is `Hmax`?
-    //   (1) first_miss[idx] > folded  -- it missed nothing at or below the frontier, so it holds every
-    //       winner there; and
-    //   (2) it holds every DURABLE overlay slot in (folded, Hmax] overlapping [addr,len].
-    // A slot with fewer than `quorum` holders is a sub-quorum / failed write: it is NEVER a block's winner
-    // (the per-block horizon always clamps below an unresolved write, and a higher acked write shadows a lower
-    // one), so it is not a required hold. Skipping it is what keeps a failed write that only the leader
-    // journaled from making a perfectly serveable read NOT_ELIGIBLE. Among durable (>= quorum) slots, (2) is
-    // still the "holds every overlap" superset rather than the minimal "holds the per-block winner"; that is
-    // safe (any two quorums intersect, so for N=3 a common holder always exists), with per-block gating left
-    // as a refinement.
+    //   (a) Synced >= L    -- filled to the login baseline (vacuous until recovery advances synced_);
+    //   (b) below the frontier: no Missing byte-range overlapping [addr,len) (per-block precise); and
+    //   (c) above the frontier: it holds every DURABLE overlay slot in (folded, Hmax] overlapping the range.
+    // A slot with fewer than `quorum` holders is a sub-quorum / failed write, never a winner, so skipped in
+    // (c). Among durable slots (c) is still the "holds every overlap" superset (safe for N=3 by quorum
+    // intersection); per-block gating there is a further refinement.
     bool eligible(std::size_t idx, uint64_t addr, uint64_t len, int64_t Hmax) {
-        int64_t const fold = folded_.load(std::memory_order_acquire);
-        if (first_miss_[idx].load(std::memory_order_acquire) <= fold) return false;
+        if (synced_[idx].load(std::memory_order_acquire) < login_dlsn_) return false; // (a)
+        {
+            std::shared_lock< std::shared_mutex > mg{map_mu_};
+            if (boost::icl::intersects(miss_[idx], byte_ivl(addr, len))) return false; // (b)
+        }
+        int64_t const fold = folded_.load(std::memory_order_acquire); // (c)
         uint64_t const b = bit(idx);
         bool ok = true;
         overlay_->foreach_all_active(fold + 1, [&](int64_t d, route_slot& s) -> bool {
@@ -173,10 +255,28 @@ public:
         return ok;
     }
 
+    // DEFERRED recovery hook (NOT called in the MVP): the future broadcast keep_alive / get_lsns sweep calls
+    // this with member `idx`'s achieved commit_lsn `C`. Everything <= C is now durably applied on the member,
+    // so its Missing entries at those dLSNs are cleared -- un-sticking a member that resynced a block it
+    // never re-acked. This is the sole place synced_ advances and the sole non-fold map mutation.
+    void advance_synced(std::size_t idx, int64_t C) {
+        std::lock_guard< std::mutex > fg{fold_mu_};
+        if (C <= synced_[idx].load(std::memory_order_relaxed)) return;
+        synced_[idx].store(C, std::memory_order_release);
+        std::unique_lock< std::shared_mutex > mg{map_mu_};
+        std::vector< boost::icl::interval< uint64_t >::type > drop;
+        for (auto const& seg : miss_[idx])
+            if (seg.second <= C) drop.push_back(seg.first);
+        for (auto const& iv : drop)
+            miss_[idx].erase(iv);
+    }
+
     // Observability / tests.
     int64_t folded() const { return folded_.load(std::memory_order_acquire); }
     bool caught_up(std::size_t idx) const {
-        return first_miss_[idx].load(std::memory_order_acquire) > folded_.load(std::memory_order_acquire);
+        if (synced_[idx].load(std::memory_order_acquire) < login_dlsn_) return false;
+        std::shared_lock< std::shared_mutex > mg{map_mu_};
+        return miss_[idx].empty();
     }
 
 private:
@@ -188,16 +288,42 @@ private:
     static bool overlaps(uint64_t a0, uint64_t l0, uint64_t a1, uint64_t l1) {
         return (a0 < a1 + l1) && (a1 < a0 + l0);
     }
-    static void fetch_min(std::atomic< int64_t >& a, int64_t v) {
-        int64_t cur = a.load(std::memory_order_relaxed);
-        while ((v < cur) && !a.compare_exchange_weak(cur, v, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+    static boost::icl::interval< uint64_t >::type byte_ivl(uint64_t a, uint64_t l) {
+        return boost::icl::interval< uint64_t >::right_open(a, a + l); // [a, a+l)
     }
 
-    std::optional< sisl::StreamTracker< route_slot > > overlay_; // dLSN -> holders/completed, sibling of the tracker
-    std::array< std::atomic< int64_t >, 64 > first_miss_{};      // per member: lowest dLSN it is known to have missed
+    void advance_folded(int64_t target) {
+        int64_t f = folded_.load(std::memory_order_relaxed);
+        while (f < target &&
+               !folded_.compare_exchange_weak(f, target, std::memory_order_release, std::memory_order_relaxed)) {}
+    }
+    void maybe_truncate(int64_t target) {
+        int64_t lt = last_trunc_.load(std::memory_order_relaxed);
+        if ((target - lt >= k_trunc_batch) &&
+            last_trunc_.compare_exchange_strong(lt, target, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            overlay_->truncate(target);
+        }
+    }
+
+    // Real CRAFT replica sets are 3/5/7/9; size the per-member arrays for that, not the bitset's 64-wide max.
+    // The holder bitset stays uint64 (trivially covers <= 9).
+    static constexpr std::size_t k_max_members = 16;
+
+    std::optional< sisl::StreamTracker< route_slot > > overlay_; // above the frontier: per-dLSN holder bitsets
+    mutable std::shared_mutex map_mu_;              // guards miss_ (shared: eligible; exclusive: fold apply)
+    std::array< missing_map, k_max_members > miss_; // below the frontier: per-member Missing byte ranges
+    std::array< std::atomic< int64_t >, k_max_members >
+        synced_{}; // per member: client's model of its commit_lsn (>= L)
+
+    std::mutex pending_mu_;                       // guards pending_
+    std::vector< pending_miss > pending_;         // durable non-universal completed slots awaiting fold
+    std::atomic< int64_t > pending_hint_{kNever}; // conservative min pending dLSN; the fold fast-path gate
+    std::mutex fold_mu_;                          // serializes the fault-path fold apply (keeps it ascending)
+
     std::size_t n_{0};
-    std::size_t quorum_{1};                 // n/2 + 1; a slot with fewer holders is failed, never a winner
-    std::atomic< int64_t > folded_{-1};     // every dLSN <= this is collapsed into first_miss (trails F on a straggler)
+    std::size_t quorum_{1};
+    int64_t login_dlsn_{-1};                // L: the Synced baseline for this session
+    std::atomic< int64_t > folded_{-1};     // every dLSN <= this is collapsed into the interval maps
     std::atomic< int64_t > last_trunc_{-1}; // gates batched truncation
     uint64_t all_mask_{0};
 };

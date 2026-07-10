@@ -261,46 +261,54 @@ missed an acked write serves a stale version -- write `0xbb`, ack at quorum on t
 who acked what: `read_route_map` (`read_route_map.hpp`).
 
 It is the **same overlay a replica uses** to route a read between its journal-tail and its applied index,
-generalized from 2 tiers on one node to N members -- and it is deliberately the **sibling of `dlsn_tracker`**:
-both are a `sisl::StreamTracker` keyed by dLSN, so the router reuses the tracker's proven concurrent spine
-(shared-lock reads, `create` at reserve, `update` at completion, `completed_upto`, `truncate`) rather than a
-hand-rolled structure.
+generalized from 2 tiers on one node to N members. Both tiers split at the commit frontier `folded`:
 
 ```
    server (one node)                          client (read_route_map, N members)
    -----------------------------------        -----------------------------------------------------
-   journal-tail overlay (commit_lsn, H]  ->   per-dLSN HOLDER BITSET over (folded, Ha]   StreamTracker slots
-   applied index        (<= commit_lsn)  ->   per-member FLOOR (<= folded)               atomics beside it
-   route: journal vs index, max D <= H   ->   route: WHICH members hold the max acked D <= H
+   journal-tail overlay (commit_lsn, H]  ->   ABOVE folded: per-dLSN HOLDER BITSET   sisl::StreamTracker
+   applied index        (<= commit_lsn)  ->   BELOW folded: per-member MISSING MAP   boost::icl interval_map
+   route: journal vs index, max D <= H   ->   route: WHICH members hold every winner <= H over the range
 ```
 
-The floor is stored inversely, as `first_miss[i]` = the **lowest dLSN member `i` is known to have missed**
-(member `i` is caught up iff `first_miss[i] > folded`). That inversion is what keeps the whole structure
-lock-free above the StreamTracker: `first_miss` is advanced by `fetch_min`, which is commutative and
-idempotent, so concurrent folds and re-application need no CAS loop and no sequential floor pass. `first_miss`
-is exactly the client's model of member `i`'s `commit_lsn` boundary (below it, `i` has everything), read
-across the wire. The one thing the N-way version adds that a single node never needs is a middle zone,
-`(first_miss[i]-1, folded]`: the writes member `i` missed while a quorum committed them, where it is routed
-around.
+**Above `folded`** (the live `(folded, Ha]` window) the overlay is a `sisl::StreamTracker<route_slot>` keyed
+by dLSN -- the **sibling of `dlsn_tracker`**, reusing its proven concurrent spine (shared-lock reads, `create`
+at reserve, `update` at completion, `completed_upto`, `truncate`). Each slot carries the holder/completed
+bitsets; its per-write updates are allocation-free bit-ORs, which is why the churny recent window stays here
+rather than folding into an interval structure on every write. It also handles the horizon clamp and
+stragglers precisely: a not-yet-acked member is simply absent from the holder set.
 
-**Fold on completion, not on the frontier.** A dLSN collapses into the floors only once *every* replica op
-for it has completed (StreamTracker's completed bit, set by the processor when the per-member `completed` mask
-fills). Folding the instant the frontier passed it would race a healthy straggler: a member that acks a
-microsecond after quorum would be read as "not a holder" and stuck behind forever. The misses are recorded
-**in the completion processor**, when `completed == all_mask`, reading `holders` under `seq_cst` so every
-acking member's bit is already visible -- so a slow-but-healthy member records no miss, and fold itself never
-reads holders (it just advances `folded` to `min(F, completed_upto)` and batch-truncates). This is why the
-`when_quorum` hook reports **every** child, not just acks.
+**Below `folded`** each member has a `boost::icl::interval_map` keyed by byte range -- the CRAFT design's
+**per-replica Missing map** (`docs/craft/rpcs.md:82-83`: an eligible replica has "no Missing slot `<= H`
+overlapping the range"). Eligibility below the frontier is one **LBA-overlap** query, so a member missing
+block X still serves reads of block Y. That is the whole point: the map replaced a per-member scalar floor
+that, once a member missed *anything*, excluded it from *every* sub-frontier read -- for N=3 that could make
+a read of a block **all three members hold** return `NOT_ELIGIBLE`. Alongside the map, `synced[i]` is the
+client's model of member `i`'s `commit_lsn` (the `Synced >= L` baseline, seeded to the login dLSN `L`,
+advanced only by the deferred recovery hook below).
 
-**Eligibility** of member `i` for a read `[addr,len]` at max horizon `Hmax` is two conditions: (1)
-`first_miss[i] > folded` (missed nothing at or below the frontier, so it holds every winner there), and (2)
-it holds every **durable** overlay slot in `(folded, Hmax]` overlapping the range. A slot with fewer than
-`quorum` holders is a sub-quorum / failed write -- never a block's winner (the per-block horizon clamps below
-an unresolved write, and a higher acked write shadows a lower one) -- so it is skipped. That skip is
-load-bearing: without it, a failed write that only the leader journaled makes a perfectly serveable read
-`NOT_ELIGIBLE` when the winner's ack straggles elsewhere. Among durable slots, (2) is still the "holds every
-overlap" superset rather than the minimal per-block winner; safe (any two quorums intersect, so for N=3 a
-common holder always exists), with per-block gating left as a refinement.
+**Fold is ascending, and records misses on fold -- not on completion.** A missed write is applied to the
+interval map only when it folds, in ascending dLSN order, because clear-on-supersede is order-sensitive:
+"member holds the latest folded write on this block -> `erase`; missed it -> `set`". Completions arrive out
+of order, so a durable-but-non-universal completed slot is handed to the fold through a small `pending_`
+queue (self-contained `{dlsn, held, addr, len}`, pushed **before** the slot's completed bit is set, so a fold
+that later sees the dLSN complete is guaranteed to see the entry). Universal (all-ack), Empty (no-ack), and
+sub-quorum (never a winner) slots hand off nothing -- so **healthy writes touch no interval map**, and a
+healthy fold is lock-free: an atomic frontier advance gated by a `pending_hint_` watermark, no map, no lock.
+Only a fold that must apply a miss (fault time) takes the `map_mu_` exclusive. This is also why the
+`when_quorum` hook reports **every** child, not just acks: the fold needs to know when all children finished
+before it decides a member missed the write, so a healthy straggler that acks just after quorum is not stuck.
+
+**Eligibility** of member `i` for a read `[addr,len]` at max horizon `Hmax` is three conditions: (a)
+`synced[i] >= L` (filled to the login baseline; vacuous until recovery advances it); (b) **below the
+frontier**, no Missing byte-range overlapping `[addr,len]` (`intersects(miss[i], ...)` under a shared lock --
+the per-block query); and (c) **above the frontier**, it holds every **durable** overlay slot in
+`(folded, Hmax]` overlapping the range. A slot with fewer than `quorum` holders is a sub-quorum / failed
+write -- never a block's winner -- so it is skipped in (c). That skip is load-bearing: without it, a failed
+write that only the leader journaled makes a perfectly serveable read `NOT_ELIGIBLE` when the winner's ack
+straggles elsewhere. Among durable slots (c) is still the "holds every overlap" superset rather than the
+minimal per-block winner; safe (any two quorums intersect, so for N=3 a common holder always exists), with
+per-block gating *above* the frontier left as a refinement -- below it, the map is already per-block.
 
 **Routing + failover** (`read()`): fold to the current frontier, then try eligible members from a **rotating
 start**. A CRAFT read has no leader affinity -- any eligible replica serves it at the horizon -- so starting
@@ -314,23 +322,28 @@ place, so a failover re-issues the same plan into the same buffer -- **no payloa
 descriptors are copied per attempt).
 
 **Bounding.** Healthy, every write reaches all members, records no miss, and its slot is batch-truncated once
-folded, so the overlay hovers near empty. A missed write's slot folds into the floors once complete -- and a
-down/refusing member completes *immediately*, so its writes fold promptly even under a sustained fault. What
-is **not** reclaimed without the deferred recovery below is a member that missed a write and later resynced:
-the client never sees an ack, so its `first_miss` stays low and it is over-avoided (safe, never stale) until
-re-login.
+folded, so the overlay hovers near empty and the interval maps stay empty. A missed write folds into the
+misser's map once complete -- and a down/refusing member completes *immediately*, so its misses land promptly
+even under a sustained fault. Each map is bounded by that member's coalesced missing byte coverage (icl
+merges adjacent ranges), and entries clear two ways: a later **non-universal** write to the range that the
+member holds erases it (clear-on-supersede), and the deferred recovery hook below erases everything `<= C`. A
+member that missed a block and then saw only **universal** rewrites of it (or none) stays over-avoided (safe,
+never stale) until recovery or re-login -- because universal writes are skipped by the fold to keep healthy
+writes lock-free, so they do not clear an earlier miss.
 
 ## What is NOT here yet
 
-**Recovery of a behind member.** A member whose floor is stuck (it missed a `<= folded` write) only re-earns
-eligibility for those reads when the client learns it caught up -- which needs a `commit_lsn` signal
-(`keep_alive`/`get_lsns` return `LSNPair`). Until then it is excluded from `<= folded` reads until re-login;
-memory stays bounded either way. This is the same overlay boundary (member `i`'s `commit_lsn`) read across
-the wire, and it pairs with the broadcast-`keep_alive` work below.
+**Recovery of a behind member.** A member with a stuck Missing entry (it missed a `<= folded` write) only
+re-earns eligibility for that block when the client learns it caught up -- which needs a `commit_lsn` signal
+(`keep_alive`/`get_lsns` return `LSNPair`). The seam is `advance_synced(i, C)`: under `map_mu_` exclusive it
+raises `synced[i]` and erases every `miss[i]` segment whose value `<= C`. Not called in the MVP; until then a
+member is over-avoided for the specific blocks it missed until re-login (memory stays bounded either way).
+This pairs with the broadcast-`keep_alive` work below.
 
-**Per-block eligibility.** Rule (2) gates on the whole range at `Hmax`, so a member behind on any overlapping
-write is routed around even for a read whose winners it all holds. Gating per block (per segment at its own
-`H`) would relax that. Safe either way; this only costs availability, never correctness.
+**Per-block eligibility above the frontier.** Rule (c) gates on the whole range at `Hmax`, so a member behind
+on any overlapping *live* (above-frontier) write is routed around even for a read whose winners it all holds.
+Gating per block (per segment at its own `H`) would relax that. Below the frontier the map is already
+per-block; this is the remaining coarse tier. Safe either way; it costs availability, never correctness.
 
 Also outstanding, in rough order:
 
@@ -467,15 +480,20 @@ deployment does not do in-process:
 |---|---|---|
 | `CraftUblkDisk` | **0** | — |
 | `dlsn_tracker`'s `StreamTracker` | 2, both *shared* | `create` at reserve + `update` at resolve; exclusive only on `truncate` (1-in-512) and resize |
-| `read_route_map`'s `StreamTracker` | 4, all *shared* | `create` at reserve + one `update` per replica completion. The **same** `sisl::StreamTracker` the tracker uses -- the router adds no bespoke lock. Completions are shared-lock updates (stragglers off the ack path); reads take the shared lock to `foreach`; exclusive only on batched `truncate`/resize. The floors are `first_miss` atomics, no lock |
+| `read_route_map`'s `StreamTracker` | 4, all *shared* | `create` at reserve + one `update` per replica completion. The **same** `sisl::StreamTracker` the tracker uses. Completions are shared-lock updates (stragglers off the ack path); reads take the shared lock to `foreach`; exclusive only on batched `truncate`/resize |
+| `read_route_map`'s `map_mu_` | 1 *shared* per read; **0** per healthy write | guards the per-member Missing maps. A read takes it *shared* for the `intersects` query (empty map = trivial); a healthy write records no miss, so it never touches it. Taken *exclusive* only by a fold that must apply a miss -- fault-cold. (`pending_mu_`/`fold_mu_` are two more std::mutexes touched only off the healthy path.) |
 | `MemTransport::mu_` | **0** | guards `by_id_`/`leader_`/`term_` only. Faults are read off a copy-on-write snapshot (`faults()`), so the IO path is two acquire loads |
 | `replica_service::mu` | 6 (post + pop, per replica) | the model's stand-in for a NIC. A real transport submits an SQE here |
 | `MemCraftReplica::mu_` | 3 (one journal insert each) | the *server*, on the far side of the wire. Not the client's cost |
 
-The router adds **no new lock kind**: it reuses `sisl::StreamTracker`'s `shared_mutex`, shared on every hot
-path (record + read), exclusive only on the batched truncate -- exactly the tracker's discipline. It copies no
-payload either: the read failover copies iovec *descriptors* per attempt, never buffer bytes. The last two
-entries are the shim's own bookkeeping, charged to the shim's threads, not the client's.
+The router keeps every **hot** path on shared locks: a read is one `StreamTracker` shared acquire (the
+above-frontier `foreach`) plus one `map_mu_` shared acquire (the below-frontier `intersects`, on a map that
+is empty in the healthy case); a healthy write is `StreamTracker` shared updates only, and a healthy fold is
+lock-free (an atomic frontier advance gated by `pending_hint_`). The one lock the interval map adds --
+`map_mu_` exclusive -- is taken only when a fold applies a real miss, i.e. at fault time; `pending_mu_` and
+`fold_mu_` are likewise fault-cold. It copies no payload either: the read failover copies iovec *descriptors*
+per attempt, never buffer bytes. The last two entries are the shim's own bookkeeping, charged to the shim's
+threads, not the client's.
 
 ### Do not benchmark the shim
 

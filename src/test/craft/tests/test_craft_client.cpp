@@ -411,14 +411,18 @@ TEST(ReadRouteMap, RecordFoldEligible) {
     EXPECT_TRUE(m.caught_up(2));
     EXPECT_FALSE(m.caught_up(0)) << "member 0 missed dLSN 0, now at/below the frontier";
 
-    // Post-fold, member 0 is behind -> excluded from ANY <= folded read (rule 1), even a block it never
-    // missed. A late completion for the folded dLSN is ignored (deferred recovery).
-    EXPECT_FALSE(m.eligible(0, blk(5), PAGE, 0));
+    // Post-fold, member 0 is missing ONLY block 0 -- per-block, not sidelined from everything. It is still
+    // eligible for a block it did not miss. This is the whole point of the LBA-range map: the old scalar
+    // excluded member 0 from block 5 too.
+    EXPECT_FALSE(m.eligible(0, blk(0), PAGE, 0)) << "missing block 0";
+    EXPECT_TRUE(m.eligible(0, blk(5), PAGE, 0)) << "holds block 5 -> still serves it";
     EXPECT_TRUE(m.eligible(1, blk(5), PAGE, 0));
+    // A late ack for the already-folded dLSN does not clear the miss (deferred recovery).
     m.record_completion(0, 0, /*acked=*/true);
     EXPECT_FALSE(m.caught_up(0));
 
-    // A universally held write records no miss: everyone stays caught up.
+    // A universally held write records no miss (and, being skipped to keep healthy writes lock-free, does not
+    // clear member 0's earlier block-0 miss either -- that waits for a non-universal supersede or recovery).
     m.create(1, blk(0), PAGE);
     m.record_completion(1, 0, true);
     m.record_completion(1, 1, true);
@@ -427,7 +431,65 @@ TEST(ReadRouteMap, RecordFoldEligible) {
     EXPECT_EQ(m.folded(), 1);
     EXPECT_TRUE(m.caught_up(1));
     EXPECT_TRUE(m.caught_up(2));
-    EXPECT_FALSE(m.caught_up(0)) << "still behind from its dLSN 0 miss";
+    EXPECT_FALSE(m.caught_up(0)) << "still missing block 0";
+
+    // Supersede: member 0 now ACKS a later (non-universal) write to block 0 -- dLSN 2, which member 2 misses.
+    // Once it folds, member 0 holds the latest folded winner on block 0, so its miss is erased; member 2 now
+    // misses block 0. This is the erase-on-hold path (clear-on-supersede in ascending order).
+    m.create(2, blk(0), PAGE);
+    m.record_completion(2, 0, true);
+    m.record_completion(2, 1, true);
+    m.record_completion(2, 2, false);
+    m.fold_to(2);
+    EXPECT_EQ(m.folded(), 2);
+    EXPECT_TRUE(m.eligible(0, blk(0), PAGE, 2)) << "a later held write superseded the block-0 miss";
+    EXPECT_TRUE(m.caught_up(0));
+    EXPECT_FALSE(m.eligible(2, blk(0), PAGE, 2)) << "member 2 missed the latest write on block 0";
+    EXPECT_FALSE(m.caught_up(2));
+}
+
+// The per-block win: a member missing block X still serves reads of a block Y it holds. Under the old scalar
+// a single miss sidelined a member from EVERY sub-frontier read; the LBA-range Missing map only routes it
+// around the blocks it actually missed.
+TEST(CraftClient, PerBlockMissStillServesOtherBlocks) {
+    auto cl = make_cluster(3);
+    // Member 2 misses block 4 (sub-quorum keeps only 0 and 1).
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0), craft::mem_replica_id(cl.vid, 1)});
+    auto v4 = page_of(0xA4);
+    ASSERT_TRUE(wr(*cl.client, 4, v4)); // dLSN 0: members 0,1 hold block 4; member 2 misses it
+    // Block 9 on members 0 and 2 -- both are REQUIRED to meet quorum, so member 2 deterministically holds it
+    // by the time the write returns (no straggler race); member 1 misses block 9.
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0), craft::mem_replica_id(cl.vid, 2)});
+    auto v9 = page_of(0xB9);
+    ASSERT_TRUE(wr(*cl.client, 9, v9)); // dLSN 1: members 0,2 hold block 9; member 1 misses it
+    cl.set.net->clear_faults();
+
+    // Take member 0 down. Member 1 missed block 9 (ineligible for it), member 0 is unreachable -- only member 2
+    // can serve, and it holds block 9. Under the scalar it was "behind" for missing block 4 and excluded from
+    // block 9 too, so this read would be NO_QUORUM. Per-block, it serves.
+    cl.set.net->set_up(craft::mem_replica_id(cl.vid, 0), false);
+    EXPECT_EQ(rd(*cl.client, 9), v9) << "member 2 missed block 4 but still serves block 9 it holds";
+}
+
+// The availability cliff the scalar had: each of the three members misses a DIFFERENT block, so all three are
+// "behind". Under the scalar a read of a block ALL THREE hold returns NOT_ELIGIBLE (everyone is sidelined).
+// Per-block, each is only missing its own block, so the shared block reads fine.
+TEST(CraftClient, ScatteredMissesDoNotSidelineEveryMember) {
+    auto cl = make_cluster(3);
+    for (uint32_t i = 0; i < 3; ++i) {
+        std::vector< peer_id_t > keep;
+        for (uint32_t j = 0; j < 3; ++j)
+            if (j != i) keep.push_back(craft::mem_replica_id(cl.vid, j));
+        cl.set.net->force_subquorum(keep); // member i excluded
+        auto v = page_of(static_cast< uint8_t >(0x10 + i));
+        ASSERT_TRUE(wr(*cl.client, i, v)); // block i: member i misses it, the other two hold it
+        cl.set.net->clear_faults();
+    }
+    auto vy = page_of(0xCC);
+    ASSERT_TRUE(wr(*cl.client, 8, vy)); // block 8: all three ack
+
+    EXPECT_EQ(rd(*cl.client, 8), vy)
+        << "block 8 is held by all three; scattered misses on other blocks must not sideline everyone";
 }
 
 // (a) The exact read-after-write violation that motivated all of this. The leader misses an acked write
