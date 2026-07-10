@@ -59,6 +59,9 @@ async_status craft_client::login(uint64_t client_token) {
         term_ = lr->term;
         lba_size_ = lr->lba_size;
         tracker_.reset_at(lr->dLSN, lr->lba_size);
+        // Seed the router for this session: everything <= the login dLSN is universally held (the login
+        // SyncRSCommitLSN barrier), and any evidence from a prior session is cleared.
+        route_->reset(replicas_.size(), lr->dLSN);
         co_return ok();
     }
     co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NOT_LEADER));
@@ -68,8 +71,10 @@ async_result< size_t > craft_client::write(uint64_t addr, uint64_t len, sisl::sg
     if (auto const e = precheck(addr, len)) co_return std::unexpected(*e);
 
     // Reserve the dLSN and record its range BEFORE the broadcast: any replica that can hold this slot
-    // implies a concurrent read's scan can already see it, which is what makes the horizon safe.
+    // implies a concurrent read's scan can already see it, which is what makes the horizon safe. The router
+    // slot is created here too, single-writer, so every completion below only updates it.
     int64_t const dlsn = tracker_.reserve(addr, len);
+    route_->create(dlsn, addr, len);
     client_hdr const hdr = make_hdr();
 
     // Ack at quorum, not at the slowest replica: a straggler must not cost every write the transport's
@@ -81,6 +86,7 @@ async_result< size_t > craft_client::write(uint64_t addr, uint64_t len, sisl::sg
     if (replicas_.size() == 1) {
         auto r = co_await homeblocks::async_write(replicas_[0], hdr, dlsn, addr, len, std::move(data));
         acks = r.has_value() ? 1 : 0;
+        route_->record_completion(dlsn, 0, /*acked=*/r.has_value());
         results = std::make_shared< std::vector< status > >(1, std::move(r));
     } else {
         // Each task gets its own sg_list descriptor copy; all point at the same caller-owned source buffer.
@@ -89,7 +95,13 @@ async_result< size_t > craft_client::write(uint64_t addr, uint64_t len, sisl::sg
         for (auto& h : replicas_) {
             futs.push_back(homeblocks::async_write(h, hdr, dlsn, addr, len, data));
         }
-        auto q = co_await when_quorum(std::move(futs), quorum());
+        // Feed EVERY replica's completion to the router, not just acks: the fold needs to know when all
+        // children have finished before it decides a member missed the write (else a healthy straggler that
+        // acks just after quorum is wrongly stuck behind). The quorum members are recorded before we resume
+        // (the hook fires before the latch), so their holds are visible before resolve() advances Ha.
+        auto q = co_await when_quorum(std::move(futs), quorum(), [route = route_, dlsn](std::size_t i, bool acked) {
+            route->record_completion(dlsn, i, acked);
+        });
         acks = q.acks;
         results = std::move(q.results);
     }
@@ -132,19 +144,13 @@ async_result< size_t > craft_client::write(uint64_t addr, uint64_t len, sisl::sg
     co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NO_QUORUM));
 }
 
-async_result< size_t > craft_client::read(uint64_t addr, uint64_t len, sisl::sg_list dest) {
-    if (auto const e = precheck(addr, len)) co_return std::unexpected(*e);
-
-    auto const plan = co_await tracker_.plan_read(addr, len);
-    if (!plan.has_value()) co_return std::unexpected(plan.error());
-
-    client_hdr const hdr = make_hdr();
-    // (N: route to an eligible holder using the per-replica Missing map -- future work.)
-    auto& target = replicas_[leader_];
-
+async_result< size_t > craft_client::issue_plan(volume_handle const& target, client_hdr hdr, read_plan const& plan,
+                                                uint64_t addr, uint64_t len, sisl::sg_list& dest) {
     // `dest` is filled in place (data extents + zero-filled holes), so the caller needs only the byte count.
-    if (plan->size() == 1) {
-        auto layout = co_await homeblocks::async_read(target, hdr, plan->front().H, addr, len, std::move(dest));
+    // We copy the descriptors (not the buffer) per attempt, so a failover can re-issue against `dest`.
+    if (plan.size() == 1) {
+        sisl::sg_list whole = dest;
+        auto layout = co_await homeblocks::async_read(target, hdr, plan.front().H, addr, len, std::move(whole));
         if (!layout.has_value()) co_return std::unexpected(layout.error());
         co_return len;
     }
@@ -153,8 +159,8 @@ async_result< size_t > craft_client::read(uint64_t addr, uint64_t len, sisl::sg_
     // passed by value into the callee's coroutine frame, so no descriptor of ours outlives this loop.
     sisl::sg_iterator slicer{dest.iovs};
     std::vector< async_result< std::vector< io_extent > > > futs;
-    futs.reserve(plan->size());
-    for (auto const& seg : *plan) {
+    futs.reserve(plan.size());
+    for (auto const& seg : plan) {
         sisl::sg_list sub;
         sub.size = seg.len;
         sub.iovs = slicer.next_iovs(static_cast< uint32_t >(seg.len));
@@ -164,6 +170,58 @@ async_result< size_t > craft_client::read(uint64_t addr, uint64_t len, sisl::sg_
         if (!r.has_value()) co_return std::unexpected(r.error());
     }
     co_return len;
+}
+
+async_result< size_t > craft_client::read(uint64_t addr, uint64_t len, sisl::sg_list dest) {
+    if (auto const e = precheck(addr, len)) co_return std::unexpected(*e);
+
+    auto const plan = co_await tracker_.plan_read(addr, len);
+    if (!plan.has_value()) co_return std::unexpected(plan.error());
+
+    client_hdr const hdr = make_hdr();
+
+    // Route to a member that actually holds the winner for this range, not blindly to the leader. Fold the
+    // router up to the current frontier, then take the highest horizon across segments: a member eligible at
+    // Hmax over the whole range is eligible for every segment at its own (<=) horizon.
+    int64_t const F = tracker_.frontier();
+    route_->fold_to(F);
+    int64_t Hmax = F;
+    for (auto const& seg : *plan)
+        Hmax = std::max(Hmax, seg.H);
+
+    // Search eligible members from a ROTATING start (not always the leader): a CRAFT read has no leader
+    // affinity -- any eligible replica serves it at the horizon -- so starting every read at the leader would
+    // pile all read load on it. The rotor advances to the peer after the first eligible one we pick, so
+    // successive reads round-robin across eligible members. It is a `thread_local` (like ublkpp's RAID1): each
+    // ublk queue thread rotates its own reads independently, so there is no cross-queue coordination and no
+    // shared atomic -- the aggregate still spreads evenly. On a transport-level failure (the holder is down or
+    // timed out) we fail over to the next eligible one; any other error (e.g. STALE_TERM) is the client's to
+    // surface. `dest` is filled in place, so re-issuing simply re-fills the same buffer.
+    std::size_t const n = replicas_.size();
+    static thread_local std::size_t read_rotor = 0;
+    std::size_t const start = read_rotor % n;
+    bool any_eligible = false;
+    std::error_condition last_err{};
+    for (std::size_t hop = 0; hop < n; ++hop) {
+        std::size_t const idx = (start + hop) % n;
+        if (!route_->eligible(idx, addr, len, Hmax)) continue;
+        if (!any_eligible) read_rotor = idx + 1; // next read on this queue thread starts at the following peer
+        any_eligible = true;
+
+        auto r = co_await issue_plan(replicas_[idx], hdr, *plan, addr, len, dest);
+        if (r.has_value()) co_return *r;
+
+        last_err = r.error();
+        bool const transport_failure = (last_err == make_error_condition(craft_error::REPLICA_DOWN)) ||
+            (last_err == std::make_error_condition(std::errc::timed_out));
+        if (!transport_failure) co_return std::unexpected(last_err);
+        // else: this holder is unreachable right now; try the next eligible member.
+    }
+
+    // No eligible member served it. NOT_ELIGIBLE if none was eligible at all (the winner's holders are all
+    // behind/excluded); NO_QUORUM if holders existed but every one failed the transport.
+    co_return std::unexpected(any_eligible ? make_error_condition(craft_error::NO_QUORUM)
+                                           : make_error_condition(craft_error::NOT_ELIGIBLE));
 }
 
 async_status craft_client::flush() {

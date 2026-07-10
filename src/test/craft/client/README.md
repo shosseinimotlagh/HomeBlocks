@@ -251,39 +251,86 @@ the reader would sleep forever.
 
 ---
 
+## Read routing: the per-member overlay
+
+The tracker decides *which version* a read may see (the per-block horizon `H_b`); the router decides *which
+replica can actually serve it*. Without the second half, `read()` unicasts to the leader, and a leader that
+missed an acked write serves a stale version -- write `0xbb`, ack at quorum on the two followers, read back
+`0xaa`. The server cannot catch this itself: a replica that missed a *suffix* of writes has
+`last_append_lsn` frozen and does not know the write exists. So the client routes, from its own record of
+who acked what: `read_route_map` (`read_route_map.hpp`).
+
+It is the **same overlay a replica uses** to route a read between its journal-tail and its applied index,
+generalized from 2 tiers on one node to N members -- and it is deliberately the **sibling of `dlsn_tracker`**:
+both are a `sisl::StreamTracker` keyed by dLSN, so the router reuses the tracker's proven concurrent spine
+(shared-lock reads, `create` at reserve, `update` at completion, `completed_upto`, `truncate`) rather than a
+hand-rolled structure.
+
+```
+   server (one node)                          client (read_route_map, N members)
+   -----------------------------------        -----------------------------------------------------
+   journal-tail overlay (commit_lsn, H]  ->   per-dLSN HOLDER BITSET over (folded, Ha]   StreamTracker slots
+   applied index        (<= commit_lsn)  ->   per-member FLOOR (<= folded)               atomics beside it
+   route: journal vs index, max D <= H   ->   route: WHICH members hold the max acked D <= H
+```
+
+The floor is stored inversely, as `first_miss[i]` = the **lowest dLSN member `i` is known to have missed**
+(member `i` is caught up iff `first_miss[i] > folded`). That inversion is what keeps the whole structure
+lock-free above the StreamTracker: `first_miss` is advanced by `fetch_min`, which is commutative and
+idempotent, so concurrent folds and re-application need no CAS loop and no sequential floor pass. `first_miss`
+is exactly the client's model of member `i`'s `commit_lsn` boundary (below it, `i` has everything), read
+across the wire. The one thing the N-way version adds that a single node never needs is a middle zone,
+`(first_miss[i]-1, folded]`: the writes member `i` missed while a quorum committed them, where it is routed
+around.
+
+**Fold on completion, not on the frontier.** A dLSN collapses into the floors only once *every* replica op
+for it has completed (StreamTracker's completed bit, set by the processor when the per-member `completed` mask
+fills). Folding the instant the frontier passed it would race a healthy straggler: a member that acks a
+microsecond after quorum would be read as "not a holder" and stuck behind forever. The misses are recorded
+**in the completion processor**, when `completed == all_mask`, reading `holders` under `seq_cst` so every
+acking member's bit is already visible -- so a slow-but-healthy member records no miss, and fold itself never
+reads holders (it just advances `folded` to `min(F, completed_upto)` and batch-truncates). This is why the
+`when_quorum` hook reports **every** child, not just acks.
+
+**Eligibility** of member `i` for a read `[addr,len]` at max horizon `Hmax` is two conditions: (1)
+`first_miss[i] > folded` (missed nothing at or below the frontier, so it holds every winner there), and (2)
+it holds every **durable** overlay slot in `(folded, Hmax]` overlapping the range. A slot with fewer than
+`quorum` holders is a sub-quorum / failed write -- never a block's winner (the per-block horizon clamps below
+an unresolved write, and a higher acked write shadows a lower one) -- so it is skipped. That skip is
+load-bearing: without it, a failed write that only the leader journaled makes a perfectly serveable read
+`NOT_ELIGIBLE` when the winner's ack straggles elsewhere. Among durable slots, (2) is still the "holds every
+overlap" superset rather than the minimal per-block winner; safe (any two quorums intersect, so for N=3 a
+common holder always exists), with per-block gating left as a refinement.
+
+**Routing + failover** (`read()`): fold to the current frontier, then try eligible members from a **rotating
+start**. A CRAFT read has no leader affinity -- any eligible replica serves it at the horizon -- so starting
+every read at the leader would pile all read load on it; the rotor advances to the peer after the one it
+picks, so successive reads round-robin across eligible members. It is a `thread_local` (like ublkpp's RAID1):
+each ublk queue thread rotates its own reads, so there is no shared atomic and no cross-queue coordination,
+and the aggregate still spreads evenly. A holder that is down or times out fails over to the next eligible
+one; any other error (`STALE_TERM`) is the client's to surface. No eligible member serves it -> `NOT_ELIGIBLE`;
+holders existed but all failed the transport -> `NO_QUORUM`. Never a silent stale read. `dest` is filled in
+place, so a failover re-issues the same plan into the same buffer -- **no payload copy** (only the iovec
+descriptors are copied per attempt).
+
+**Bounding.** Healthy, every write reaches all members, records no miss, and its slot is batch-truncated once
+folded, so the overlay hovers near empty. A missed write's slot folds into the floors once complete -- and a
+down/refusing member completes *immediately*, so its writes fold promptly even under a sustained fault. What
+is **not** reclaimed without the deferred recovery below is a member that missed a write and later resynced:
+the client never sees an ack, so its `first_miss` stays low and it is over-avoided (safe, never stale) until
+re-login.
+
 ## What is NOT here yet
 
-**Read routing.** Every segment above goes to `replicas_[leader_]`, and that peer's error is surfaced
-directly. There is no failover, no eligibility check, and no per-replica **Missing map**.
+**Recovery of a behind member.** A member whose floor is stuck (it missed a `<= folded` write) only re-earns
+eligibility for those reads when the client learns it caught up -- which needs a `commit_lsn` signal
+(`keep_alive`/`get_lsns` return `LSNPair`). Until then it is excluded from `<= folded` reads until re-login;
+memory stays bounded either way. This is the same overlay boundary (member `i`'s `commit_lsn`) read across
+the wire, and it pairs with the broadcast-`keep_alive` work below.
 
-This is a correctness gap, not just a resilience one. The tracker decides *which version* a read may see;
-the Missing map decides *which replica can actually serve it*. The design calls the second half
-**route-around** (`CRAFT-Design.md`, "Case (b)"):
-
-```
-   what we have                       what is missing
-   ────────────                       ───────────────
-   H_b  = safe horizon per block      target = a replica that HOLDS the winner at H_b
-
-   if the leader was not in the       ┌─ leader lacks the acked N ─────────────┐
-   write quorum for the acked N       │  serves M (unresolved) or older        │
-   that wins block b, then at         │  ✗ exposes an unresolved write         │
-   H_b = Ha it serves the wrong       │  ✗ hides a durable one                 │
-   version and BOTH guarantees        └────────────────────────────────────────┘
-   break.  REACHABLE TODAY: delay
-   the LEADER past op_timeout_ms.     route-around: pick any member of N's write
-                                      quorum -- at least one never received M.
-```
-
-The client already knows, per write, which replicas acked, so the raw material for a Missing map exists;
-it is just not kept. Until it is, `read()` is correct **only when the leader is in the write quorum of
-every winner in the range** — which the model's default configuration always satisfies, and which
-`force_subquorum`, or delaying the leader past the deadline, violates.
-
-This is measured, not theorised. Delay the leader, write `0xbb`, get the ack (quorum on the two followers),
-lift the delay, read back — `0xaa`. The write was reported durable to the application and the very next read
-returned the old value. Delaying a *follower* is safe, because the leader is in the ack set of every write
-the client committed.
+**Per-block eligibility.** Rule (2) gates on the whole range at `Hmax`, so a member behind on any overlapping
+write is routed around even for a read whose winners it all holds. Gating per block (per segment at its own
+`H`) would relax that. Safe either way; this only costs availability, never correctness.
 
 Also outstanding, in rough order:
 
@@ -297,9 +344,6 @@ Also outstanding, in rough order:
 - reply-side fault injection. The wire models the request leg only: `plan_delivery` conflates the round trip
   into one `delay`, and the reply is the coroutine's return value rather than a message. A peer that applies
   a write and then loses or delays its *reply* needs `request_latency` and `reply_latency` as separate legs.
-
-Writes ack at quorum (`when_quorum`); reads do not, because they are unicast. A read that the leader
-cannot serve has no failover — that is the Missing map above, not a fan-out problem.
 
 ---
 
@@ -414,18 +458,24 @@ replica -- which is precisely the seam a real transport will occupy.
 
 ### Where the locks are
 
-Nothing under `client/` declares a mutex. Every lock a 4 KiB write to three replicas touches lives in the
-**model**, and each one is standing in for something a real deployment does not do in-process:
+Nothing under `client/` declares a mutex of its own. The client-side locks a 4 KiB write to three replicas
+touches are all `sisl::StreamTracker`'s internal `shared_mutex` (the tracker's and the router's), taken
+**shared** on every hot path; the rest live in the **model**, each standing in for something a real
+deployment does not do in-process:
 
 | lock | acquisitions per write | what it really is |
 |---|---|---|
-| `dlsn_tracker`, `craft_client`, `CraftUblkDisk` | **0** | — |
-| `StreamTracker`'s `shared_mutex` | 2, both *shared* | inside sisl; exclusive only on `truncate` (1-in-512) and on resize |
+| `CraftUblkDisk` | **0** | — |
+| `dlsn_tracker`'s `StreamTracker` | 2, both *shared* | `create` at reserve + `update` at resolve; exclusive only on `truncate` (1-in-512) and resize |
+| `read_route_map`'s `StreamTracker` | 4, all *shared* | `create` at reserve + one `update` per replica completion. The **same** `sisl::StreamTracker` the tracker uses -- the router adds no bespoke lock. Completions are shared-lock updates (stragglers off the ack path); reads take the shared lock to `foreach`; exclusive only on batched `truncate`/resize. The floors are `first_miss` atomics, no lock |
 | `MemTransport::mu_` | **0** | guards `by_id_`/`leader_`/`term_` only. Faults are read off a copy-on-write snapshot (`faults()`), so the IO path is two acquire loads |
 | `replica_service::mu` | 6 (post + pop, per replica) | the model's stand-in for a NIC. A real transport submits an SQE here |
 | `MemCraftReplica::mu_` | 3 (one journal insert each) | the *server*, on the far side of the wire. Not the client's cost |
 
-Both remaining entries are the shim's own bookkeeping, charged to the shim's threads, not the client's.
+The router adds **no new lock kind**: it reuses `sisl::StreamTracker`'s `shared_mutex`, shared on every hot
+path (record + read), exclusive only on the batched truncate -- exactly the tracker's discipline. It copies no
+payload either: the read failover copies iovec *descriptors* per attempt, never buffer bytes. The last two
+entries are the shim's own bookkeeping, charged to the shim's threads, not the client's.
 
 ### Do not benchmark the shim
 
@@ -542,17 +592,19 @@ what reorders arrivals, because writes issued during the delay land *after* writ
                   r2: commit_lag   1  missing  0             <- last gap fills, frontier leaps
 ```
 
-**Delaying the LEADER is a read-after-write violation, on purpose.** Reads are unicast to the leader and
-there is no per-replica Missing map (see *What is NOT here yet* above), so a leader that missed an acked
-write serves the old version of the LBAs that write covered. The window opens when its delay is lifted and
-the late writes are still queued: reads stop timing out but the data has not arrived. Measured, not theorised:
-write `0xbb`, get an ack, read back `0xaa`. The endpoint logs a warning when you do it. It is the sharpest
-demonstration of why the Missing map is a correctness gap and not a resilience nicety. Delaying a *follower*
-is safe, because the leader is in the ack set of every write the client committed.
+**Delaying the LEADER used to be a read-after-write violation; the read router now fails over instead.** Delay
+the leader past `op_timeout_ms` and its writes miss quorum, so it lacks acked writes the followers hold. The
+router (see *Read routing* above) marks it not-a-holder for those dLSNs and routes reads to a follower that
+holds the winner, so the client returns the new value -- write `0xbb`, ack on the two followers, read back
+`0xbb`, not the stale `0xaa` it returned before the router. What the delay still surfaces on the endpoint is
+the leader falling *behind*: its `commit_lag` / `missing` climb, and it stays routed-around for those blocks
+until it catches up (recovery is deferred; today, until re-login). Delaying a *follower* was always safe,
+because the leader is in the ack set of every write the client committed.
 
-Two properties survive it: no divergence (the late write carries a lower dLSN than the slots stacked above
-it, and `apply_up_to` applies in dLSN order once the gap fills, so every replica converges), and no
-read-stability violation (the value goes old to new, never backwards).
+Two properties still hold on the server side once the delay lifts and the late writes land: no divergence (the
+late write carries a lower dLSN than the slots stacked above it, and `apply_up_to` applies in dLSN order once
+the gap fills, so every replica converges), and no read-stability violation (the value goes old to new, never
+backwards).
 
 ## Tests
 

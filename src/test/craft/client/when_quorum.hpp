@@ -41,6 +41,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <variant>
@@ -77,11 +78,19 @@ struct quorum_latch {
     }
 };
 
+// Called once per child as it completes, on whatever thread completed it (stragglers included), with the
+// child's fan-out index and whether it acked. Keyed on the local `acked` flag, NOT on results[index]: a
+// throwing child leaves results[index] default-constructed, which for status = expected<void> reads
+// has_value() == true, a phantom ack the hook must never publish. The client uses this to record per-member
+// hold evidence into read_route_map (see craft_client::write).
+using completion_hook = std::function< void(std::size_t index, bool acked) >;
+
 // Awaits one child, records its result, and arrives at the latch. Swallows exceptions (a throwing child
 // must not strand the latch), leaving that slot default-constructed and counted as a non-ack.
 template < typename T >
 sisl::async::task< void > quorum_run_one(sisl::async::task< T > child, std::shared_ptr< std::vector< T > > results,
-                                         std::size_t index, std::shared_ptr< quorum_latch > latch) {
+                                         std::size_t index, std::shared_ptr< quorum_latch > latch,
+                                         completion_hook on_each) {
     bool acked = false;
     try {
         auto r = co_await std::move(child);
@@ -90,6 +99,10 @@ sisl::async::task< void > quorum_run_one(sisl::async::task< T > child, std::shar
     } catch (...) {
         // leave results[index] default-constructed; counted as a non-ack
     }
+    // Publish evidence BEFORE arriving: on the quorum-th ack, arrive() fires the latch and write() resumes,
+    // so recording here means every quorum member's hold is visible before resolve() advances Ha, hence
+    // before any later read can observe the slot.
+    if (on_each) on_each(index, acked);
     latch->arrive(acked);
 }
 
@@ -104,8 +117,11 @@ struct quorum_result {
 
 // Start every task concurrently; resume once `quorum` of them have completed with a value, or once all
 // have finished, whichever comes first. Stragglers keep running detached and keep `results` alive.
+// `on_each`, if set, fires once per child as it completes (see completion_hook); default {} leaves behavior
+// unchanged for callers that do not observe per-member outcomes.
 template < typename T >
-sisl::async::task< quorum_result< T > > when_quorum(std::vector< sisl::async::task< T > > tasks, std::size_t quorum) {
+sisl::async::task< quorum_result< T > > when_quorum(std::vector< sisl::async::task< T > > tasks, std::size_t quorum,
+                                                    detail::completion_hook on_each = {}) {
     auto const n = tasks.size();
     auto results = std::make_shared< std::vector< T > >(n);
     if (n == 0) co_return quorum_result< T >{0, std::move(results)};
@@ -115,8 +131,9 @@ sisl::async::task< quorum_result< T > > when_quorum(std::vector< sisl::async::ta
         // Each child runs synchronously to its first suspension right here, which is where it consumes the
         // caller's payload. exec::task has sticky scheduler affinity, so inject inline_scheduler to let the
         // detached child resume on whatever thread completes it (identical to sisl::async::when_all).
-        stdexec::start_detached(stdexec::write_env(detail::quorum_run_one< T >(std::move(tasks[i]), results, i, latch),
-                                                   stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}));
+        stdexec::start_detached(
+            stdexec::write_env(detail::quorum_run_one< T >(std::move(tasks[i]), results, i, latch, on_each),
+                               stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}));
     }
     co_await latch->done;
     co_return quorum_result< T >{latch->acks.load(std::memory_order_acquire), std::move(results)};

@@ -25,6 +25,7 @@
 // injected latency and the op deadline. Peer-to-peer concerns (leader election, login orchestration, resync,
 // fault injection) live there too. Nothing in this file copies payload bytes.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -88,6 +89,9 @@ public:
     // liveness (is_up / write_allowed) ask the transport themselves.
     replica_stats stats() const;
 
+    // Test observability: reads this replica has served (see reads_served_).
+    std::size_t reads_served() const { return reads_served_.load(std::memory_order_relaxed); }
+
     // ── craft_replica: client-facing ──
     async_result< LoginResult > login(uint64_t client_token) override;
     async_status logout(client_hdr hdr) override;
@@ -146,6 +150,10 @@ private:
     void cold_apply_login(uint64_t client_token, uint64_t term);
     void cold_apply_logout();
     void cold_truncate_above(int64_t rs_commit_lsn);
+
+    // Test observability: how many reads this replica actually served. Lets a test witness read routing
+    // (e.g. round-robin distribution across members). Not part of the CRAFT surface.
+    std::atomic< std::size_t > reads_served_{0};
 
     replica_endpoint ep_;
     uint32_t page_size_;

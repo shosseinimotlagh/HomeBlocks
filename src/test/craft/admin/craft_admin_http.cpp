@@ -280,13 +280,11 @@ std::shared_ptr< sisl::HttpServer > start_admin_http(uint16_t port, std::shared_
                  }
 
                  auto const id = ctx->replicas[*idx]->id();
-                 // Reads are unicast to the leader and there is no per-replica Missing map yet, so a leader
-                 // that misses an acked write serves a stale version of the LBAs that write covered, once its
-                 // delay is lifted and the late writes are still queued. Allowed on purpose (it is how you
-                 // demonstrate the gap), but say so.
+                 // The read router now fails over off a leader that missed acked writes, so this no longer
+                 // yields a stale read -- it demonstrates the leader falling behind and being routed around.
                  if ((ms > 0) && (id == ctx->net->leader())) {
-                     LOGWARN("CRAFT admin: delaying the LEADER ({} ms). Reads route to it and there is no "
-                             "Missing map, so reads of LBAs covered by its late writes may be stale.",
+                     LOGINFO("CRAFT admin: delaying the LEADER ({} ms). Its writes miss quorum; the client "
+                             "routes reads of the affected LBAs to a follower that holds them.",
                              ms);
                  }
                  ctx->net->set_delay(id, std::chrono::milliseconds{ms});

@@ -111,7 +111,8 @@ result< std::vector< io_extent > > MemCraftReplica::do_read(client_hdr hdr, int6
     if (dest.size < len) { return std::unexpected(std::make_error_condition(std::errc::invalid_argument)); }
     std::lock_guard< std::mutex > g{mu_};
     if (hdr.term != state_.term) return fail(craft_error::STALE_TERM);
-    apply_up_to(hdr.commit_lsn); // piggybacked commit: advance the frontier opportunistically
+    apply_up_to(hdr.commit_lsn);                           // piggybacked commit: advance the frontier opportunistically
+    reads_served_.fetch_add(1, std::memory_order_relaxed); // test observability: witness read routing
     return read_range(read_lsn, addr, len, dest);
 }
 

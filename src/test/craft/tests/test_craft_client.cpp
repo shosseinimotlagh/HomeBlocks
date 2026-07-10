@@ -20,6 +20,7 @@
 // force_subquorum) exercises the quorum path the next step builds on.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -37,6 +38,7 @@
 #include "craft_test_util.hpp"
 #include "model/mem_craft_volume.hpp" // make_memory_replica_set, mem_replica_id (via mem_craft_cluster.hpp)
 #include "client/craft_client.hpp"
+#include "client/read_route_map.hpp"
 
 SISL_LOGGING_DEF(homeblocks)
 SISL_LOGGING_INIT(homeblocks)
@@ -373,6 +375,177 @@ TEST(CraftClient, N3_ConcurrentWritersFromManyThreads) {
     for (uint64_t b = 0; b < kBlocks; ++b) {
         EXPECT_EQ(rd(*cl.client, b), page_of(static_cast< uint8_t >(b & 0xFF))) << "block " << b;
     }
+}
+
+// --- read routing + failover: the per-member eligibility map (read_route_map) ---
+
+// The map in isolation: create at reserve, complete, fold on completion, gate eligibility.
+TEST(ReadRouteMap, RecordFoldEligible) {
+    craft::read_route_map m;
+    m.reset(3, /*L=*/-1);
+    EXPECT_EQ(m.folded(), -1);
+    for (std::size_t i = 0; i < 3; ++i)
+        EXPECT_TRUE(m.caught_up(i));
+
+    // dLSN 0 over block 0. Members 1 and 2 ack; member 0 has not completed yet.
+    m.create(0, blk(0), PAGE);
+    m.record_completion(0, 1, /*acked=*/true);
+    m.record_completion(0, 2, /*acked=*/true);
+
+    // Before it is complete/folded, eligibility reads straight off the holder set: member 0 is not a holder.
+    EXPECT_FALSE(m.eligible(0, blk(0), PAGE, /*Hmax=*/0));
+    EXPECT_TRUE(m.eligible(1, blk(0), PAGE, 0));
+    EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 0)); // a non-overlapping read is eligible for everyone
+    EXPECT_TRUE(m.eligible(0, blk(5), PAGE, 0));
+
+    // Incomplete (member 0's op has not finished), so fold stalls -- nobody is stuck yet.
+    m.fold_to(0);
+    EXPECT_EQ(m.folded(), -1) << "incomplete: not folded";
+    EXPECT_TRUE(m.caught_up(0));
+
+    // Member 0's op completes as a terminal miss -> the slot is complete, the miss is recorded, fold advances.
+    m.record_completion(0, 0, /*acked=*/false);
+    m.fold_to(0);
+    EXPECT_EQ(m.folded(), 0);
+    EXPECT_TRUE(m.caught_up(1));
+    EXPECT_TRUE(m.caught_up(2));
+    EXPECT_FALSE(m.caught_up(0)) << "member 0 missed dLSN 0, now at/below the frontier";
+
+    // Post-fold, member 0 is behind -> excluded from ANY <= folded read (rule 1), even a block it never
+    // missed. A late completion for the folded dLSN is ignored (deferred recovery).
+    EXPECT_FALSE(m.eligible(0, blk(5), PAGE, 0));
+    EXPECT_TRUE(m.eligible(1, blk(5), PAGE, 0));
+    m.record_completion(0, 0, /*acked=*/true);
+    EXPECT_FALSE(m.caught_up(0));
+
+    // A universally held write records no miss: everyone stays caught up.
+    m.create(1, blk(0), PAGE);
+    m.record_completion(1, 0, true);
+    m.record_completion(1, 1, true);
+    m.record_completion(1, 2, true);
+    m.fold_to(1);
+    EXPECT_EQ(m.folded(), 1);
+    EXPECT_TRUE(m.caught_up(1));
+    EXPECT_TRUE(m.caught_up(2));
+    EXPECT_FALSE(m.caught_up(0)) << "still behind from its dLSN 0 miss";
+}
+
+// (a) The exact read-after-write violation that motivated all of this. The leader misses an acked write
+// because it was delayed past the op timeout; the read must route AROUND it to a follower that holds the new
+// value. With the leader reachable again (but still lacking the write), routing to it would return the stale
+// 0xAA -- which is the bug this fixes.
+TEST(CraftClient, LeaderDelayReadReturnsNewValue) {
+    auto cl = make_cluster(3); // leader == 0
+    auto v_old = page_of(0xAA);
+    ASSERT_TRUE(wr(*cl.client, 8, v_old)); // dLSN 0: all three ack
+
+    cl.set.net->set_op_timeout(std::chrono::milliseconds{20});
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::milliseconds{500});
+    auto v_new = page_of(0xBB);
+    ASSERT_TRUE(wr(*cl.client, 8, v_new)) << "quorum(3)=2 met by the followers; the leader times out";
+
+    // Reachable again, but its late delivery is ~500ms out, so it still holds only 0xAA right now.
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::milliseconds{0});
+
+    EXPECT_EQ(rd(*cl.client, 8), v_new) << "routed around the stale leader to a follower holding 0xBB";
+}
+
+// (b) The same failover reached the deterministic way: a sub-quorum that excludes the leader. The leader
+// provably never received the write (REPLICA_DOWN), so it is excluded from the read.
+TEST(CraftClient, SubquorumExcludingLeaderRoutesAround) {
+    auto cl = make_cluster(3);
+    auto v_old = page_of(0xAA);
+    ASSERT_TRUE(wr(*cl.client, 3, v_old)); // dLSN 0: all ack
+
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 1), craft::mem_replica_id(cl.vid, 2)});
+    auto v_new = page_of(0xBB);
+    ASSERT_TRUE(wr(*cl.client, 3, v_new)) << "quorum(3)=2 met by the two followers";
+    cl.set.net->clear_faults();
+
+    EXPECT_EQ(rd(*cl.client, 3), v_new) << "leader is provably missing dLSN 1; routed to a follower";
+}
+
+// (c) No regression on the healthy path: every write reaches all three, so no member ever records a miss and
+// all stay caught up and eligible. Robust against straggler timing: a healthy write records a miss for no one
+// (held == all_mask), so caught_up is never transiently false.
+TEST(CraftClient, HealthyClusterNoRegression) {
+    auto cl = make_cluster(3);
+    auto b0 = page_of(0x11);
+    auto b1 = page_of(0x22);
+    ASSERT_TRUE(wr(*cl.client, 2, b0));
+    ASSERT_TRUE(wr(*cl.client, 7, b1));
+    EXPECT_EQ(rd(*cl.client, 2), b0);
+    EXPECT_EQ(rd(*cl.client, 7), b1);
+    for (std::size_t i = 0; i < 3; ++i)
+        EXPECT_TRUE(cl.client->route_caught_up(i)) << "member " << i << " missed nothing; caught up";
+}
+
+// (c2) Reads round-robin across eligible members rather than piling on the leader. A CRAFT read has no leader
+// affinity, so the router rotates the start each read. All three hold the block and are eligible, so a run of
+// reads (a multiple of 3) lands an equal share on each -- deterministic on the single test thread regardless
+// of the rotor's starting value (any 3k consecutive reads split evenly across 3 members).
+TEST(CraftClient, HealthyReadsRoundRobinAcrossMembers) {
+    auto cl = make_cluster(3);
+    auto buf = page_of(0x5A);
+    ASSERT_TRUE(wr(*cl.client, 4, buf)); // all three hold it -> all eligible
+
+    std::array< std::size_t, 3 > before{};
+    for (std::size_t i = 0; i < 3; ++i)
+        before[i] = cl.set.replicas[i]->reads_served();
+
+    constexpr std::size_t kReads = 30;
+    for (std::size_t i = 0; i < kReads; ++i)
+        EXPECT_EQ(rd(*cl.client, 4), buf);
+
+    for (std::size_t i = 0; i < 3; ++i)
+        EXPECT_EQ(cl.set.replicas[i]->reads_served() - before[i], kReads / 3)
+            << "member " << i << " served an uneven share -- reads did not round-robin";
+}
+
+// (d) When every holder of the winner is unreachable, the read must FAIL (NO_QUORUM), never fall back to a
+// member that is missing the write and serve stale data.
+TEST(CraftClient, AllHoldersDownReturnsNotEligible) {
+    auto cl = make_cluster(3);
+    auto v_old = page_of(0xAA);
+    ASSERT_TRUE(wr(*cl.client, 5, v_old)); // dLSN 0: all ack
+
+    // Followers hold dLSN 1; the leader is provably missing it.
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 1), craft::mem_replica_id(cl.vid, 2)});
+    auto v_new = page_of(0xBB);
+    ASSERT_TRUE(wr(*cl.client, 5, v_new));
+    cl.set.net->clear_faults();
+
+    // Now take both holders down. The only member "eligible" by holding is unreachable; the leader is
+    // ineligible (behind). The read must not serve the leader's stale 0xAA.
+    cl.set.net->set_up(craft::mem_replica_id(cl.vid, 1), false);
+    cl.set.net->set_up(craft::mem_replica_id(cl.vid, 2), false);
+
+    std::vector< uint8_t > dest(PAGE, 0xEE);
+    auto r = rg(cl.client->read(blk(5), PAGE, one_iov(dest)));
+    ASSERT_FALSE(r.has_value()) << "no reachable holder; must not serve stale data";
+    EXPECT_TRUE(r.error() == make_error_condition(craft_error::NO_QUORUM) ||
+                r.error() == make_error_condition(craft_error::NOT_ELIGIBLE))
+        << "got: " << r.error().message();
+    EXPECT_NE(dest, v_old) << "never filled from the stale leader";
+}
+
+// (e) A member that missed an acked write is marked behind and routed around. The sub-quorum drop is the
+// FIRST write, so its completion is deterministic: the dropped replica returns REPLICA_DOWN inline and the
+// two quorum members must both ack before the write returns, so all three completions are recorded before
+// the read folds -- no healthy straggler to stall the fold (which is correct, but non-deterministic to
+// assert against).
+TEST(CraftClient, BehindMemberIsRoutedAround) {
+    auto cl = make_cluster(3);
+
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0), craft::mem_replica_id(cl.vid, 1)});
+    auto v = page_of(0xBB);
+    ASSERT_TRUE(wr(*cl.client, 6, v)); // dLSN 0: leader + follower 1 ack, follower 2 provably misses it
+    cl.set.net->clear_faults();
+
+    EXPECT_EQ(rd(*cl.client, 6), v) << "served by a holder (the leader)";
+    EXPECT_FALSE(cl.client->route_caught_up(2)) << "follower 2 missed the acked write; behind the frontier";
+    EXPECT_TRUE(cl.client->route_caught_up(0)) << "leader held it; still caught up";
+    EXPECT_TRUE(cl.client->route_caught_up(1)) << "follower 1 held it; still caught up";
 }
 
 int main(int argc, char* argv[]) {

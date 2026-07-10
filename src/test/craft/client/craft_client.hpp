@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <system_error>
 #include <vector>
@@ -30,6 +31,7 @@
 #include <homeblks/home_blocks.hpp>
 
 #include "dlsn_tracker.hpp"
+#include "read_route_map.hpp"
 
 namespace homeblocks::craft {
 
@@ -59,6 +61,10 @@ public:
     int64_t read_horizon() const { return tracker_.read_horizon(); }
     // Test hook: how many reads paid for the per-block winner pass.
     uint64_t winner_scans() const { return tracker_.winner_scans(); }
+    // Test/observability hooks into the read-routing map: the folded frontier, and whether a member is caught
+    // up to it (a behind member is routed around for <= folded reads).
+    int64_t route_folded() const { return route_->folded(); }
+    bool route_caught_up(std::size_t idx) const { return route_->caught_up(idx); }
 
     // Observability: the client's dLSN watermarks + the unresolved slots pinning the frontier. Safe to call
     // from any thread while IO is in flight. (Named dlsn_stats, not tracker_stats, so the member does not
@@ -78,12 +84,23 @@ private:
     // The two guards every IO opens with; nullopt means the IO may proceed.
     std::optional< std::error_condition > precheck(uint64_t addr, uint64_t len) const;
 
+    // Issue a whole read plan to one target, filling `dest` in place. Factored out of read() so the router
+    // can retry it against the next eligible member on a transport failure. `dest` is copied per attempt
+    // (descriptors only; both point at the caller's buffer), so a failover re-fills the same buffer.
+    async_result< size_t > issue_plan(volume_handle const& target, client_hdr hdr, read_plan const& plan, uint64_t addr,
+                                      uint64_t len, sisl::sg_list& dest);
+
     std::vector< volume_handle > replicas_;
     uint32_t leader_{0};
     uint64_t term_{0};
     uint32_t lba_size_{0};
 
     dlsn_tracker tracker_;
+    // shared_ptr, not a plain member: a detached when_quorum straggler's completion hook records into this
+    // map and may finish after the client is destroyed. The hook captures a copy, so a late completion
+    // writes into a still-alive (orphaned) map rather than a freed one -- the same discipline the transport
+    // uses for MemCraftReplica.
+    std::shared_ptr< read_route_map > route_{std::make_shared< read_route_map >()};
 };
 
 } // namespace homeblocks::craft
