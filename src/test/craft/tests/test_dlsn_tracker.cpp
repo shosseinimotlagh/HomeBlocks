@@ -119,6 +119,70 @@ TEST_F(DlsnTracker, EmptyResolvesAndReleasesTheFrontier) {
     EXPECT_EQ(t.frontier(), 1);
 }
 
+// --- stats(): the observability snapshot behind craft_ublk's REST endpoint ---
+
+// The unresolved slots are the holes between the frontier and the highest issued dLSN. They are what hold
+// the frontier down, so `unresolved_count` must fall to 0 once every write resolves.
+TEST_F(DlsnTracker, StatsReportsUnresolvedSlots) {
+    for (uint64_t i = 0; i < 5; ++i) {
+        issue(t, i); // dLSN 0..4
+    }
+    t.resolve(0, slot_outcome::acked);
+    t.resolve(1, slot_outcome::acked);
+    t.resolve(3, slot_outcome::acked); // 2 and 4 stay in flight
+
+    auto const s = t.stats(16);
+    EXPECT_EQ(s.frontier, 1); // pinned below the in-flight dLSN 2
+    EXPECT_EQ(s.highest_acked, 3);
+    EXPECT_EQ(s.issued, 4);
+    EXPECT_EQ(s.unresolved_count, 2u);
+    EXPECT_EQ(s.unresolved_sample, (std::vector< int64_t >{2, 4}));
+
+    t.resolve(2, slot_outcome::acked);
+    t.resolve(4, slot_outcome::acked);
+    auto const done = t.stats(16);
+    EXPECT_EQ(done.frontier, 4);
+    EXPECT_EQ(done.unresolved_count, 0u) << "at rest nothing may remain unresolved";
+    EXPECT_TRUE(done.unresolved_sample.empty());
+}
+
+// A failed slot is unresolved just like an in_flight one: nothing resolves it without a leader round, so it
+// keeps showing up as a hole. An Empty slot resolves and disappears.
+TEST_F(DlsnTracker, StatsCountsFailedButNotEmptySlots) {
+    for (uint64_t i = 0; i < 3; ++i) {
+        issue(t, i);
+    }
+    t.resolve(0, slot_outcome::failed);
+    t.resolve(1, slot_outcome::empty);
+    t.resolve(2, slot_outcome::acked);
+
+    auto const s = t.stats(16);
+    EXPECT_EQ(s.frontier, -1); // the failed dLSN 0 pins it
+    EXPECT_EQ(s.issued, 2);
+    EXPECT_EQ(s.unresolved_count, 1u);
+    EXPECT_EQ(s.unresolved_sample, (std::vector< int64_t >{0}));
+}
+
+// The count stays exact past the caller's sample cap.
+TEST_F(DlsnTracker, StatsSampleIsCappedButCountIsExact) {
+    for (uint64_t i = 0; i < 6; ++i) {
+        issue(t, i);
+    }
+    auto const s = t.stats(2); // all 6 in flight
+    EXPECT_EQ(s.unresolved_count, 6u);
+    EXPECT_EQ(s.unresolved_sample, (std::vector< int64_t >{0, 1}));
+}
+
+// Before login there is no window to scan; stats() must not touch the absent StreamTracker.
+TEST(DlsnTrackerPreLogin, StatsOnFreshTrackerIsEmpty) {
+    dlsn_tracker fresh{128};
+    auto const s = fresh.stats(16);
+    EXPECT_EQ(s.frontier, -1);
+    EXPECT_EQ(s.highest_acked, -1);
+    EXPECT_EQ(s.issued, -1);
+    EXPECT_EQ(s.unresolved_count, 0u);
+}
+
 TEST_F(DlsnTracker, RecoveryLoginSeedsBothWatermarks) {
     t.reset_at(1000, BS); // rs_commit_lsn from a recovery login
     EXPECT_EQ(t.frontier(), 1000);

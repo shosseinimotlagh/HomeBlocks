@@ -13,6 +13,7 @@
  *
  *********************************************************************************/
 #include "craft_client.hpp"
+#include "when_quorum.hpp"
 
 #include <utility>
 #include <vector>
@@ -71,42 +72,64 @@ async_result< size_t > craft_client::write(uint64_t addr, uint64_t len, sisl::sg
     int64_t const dlsn = tracker_.reserve(addr, len);
     client_hdr const hdr = make_hdr();
 
+    // Ack at quorum, not at the slowest replica: a straggler must not cost every write the transport's
+    // timeout. Stragglers keep running detached, so each replica op must have consumed `data` by its first
+    // suspension point (see when_quorum.hpp) -- the caller may recycle the buffer the moment we return.
     std::size_t acks = 0;
-    std::size_t refused = 0; // deterministic rejections: that replica provably did not journal it
-    std::error_condition last_err{};
-    auto const tally = [&](auto const& r) {
-        if (r.has_value()) {
-            ++acks;
-        } else {
-            last_err = r.error();
-            if (r.error() == std::make_error_condition(std::errc::invalid_argument)) ++refused;
-        }
-    };
+    std::shared_ptr< std::vector< status > > results;
 
     if (replicas_.size() == 1) {
-        tally(co_await homeblocks::async_write(replicas_[0], hdr, dlsn, addr, len, std::move(data)));
+        auto r = co_await homeblocks::async_write(replicas_[0], hdr, dlsn, addr, len, std::move(data));
+        acks = r.has_value() ? 1 : 0;
+        results = std::make_shared< std::vector< status > >(1, std::move(r));
     } else {
-        // Each task gets its own sg_list descriptor copy; all point at the same caller-owned source buffer,
-        // which the caller keeps alive across the co_await.
+        // Each task gets its own sg_list descriptor copy; all point at the same caller-owned source buffer.
         std::vector< async_status > futs;
         futs.reserve(replicas_.size());
         for (auto& h : replicas_) {
             futs.push_back(homeblocks::async_write(h, hdr, dlsn, addr, len, data));
         }
-        for (auto const& r : co_await sisl::async::when_all(std::move(futs))) {
-            tally(r);
-        }
+        auto q = co_await when_quorum(std::move(futs), quorum());
+        acks = q.acks;
+        results = std::move(q.results);
     }
 
-    if (acks < quorum()) {
-        // If EVERY replica refused deterministically, the slot is provably absent set-wide: a resolved
-        // no-op that must not pin the commit frontier. Otherwise some replica may hold it, so the slot
-        // stays unresolved until the leader fills or Empties it, and commit correctly stalls there.
-        tracker_.resolve(dlsn, (refused == replicas_.size()) ? slot_outcome::empty : slot_outcome::failed);
-        co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NO_QUORUM));
+    if (acks >= quorum()) {
+        // Quorum-durable. Do NOT read `results`: children we stopped waiting for may still be writing it.
+        tracker_.resolve(dlsn, slot_outcome::acked);
+        co_return len;
     }
-    tracker_.resolve(dlsn, slot_outcome::acked);
-    co_return len;
+
+    // Sub-quorum. The latch cannot have fired on the quorum trigger, so every child has finished and the
+    // per-replica errors are safe to read.
+    //
+    // A DETERMINISTIC rejection means the peer decided the request and provably did not journal it:
+    //   - invalid_argument: it evaluated the request and refused it.
+    //   - REPLICA_DOWN:     the request was never delivered to it.
+    // Unanimity is what makes that useful. If EVERY replica rejected deterministically, nobody holds the
+    // slot and it is provably absent set-wide: Empty, a resolved no-op that must not pin the frontier. A
+    // subset proves nothing, so the slot stays unresolved and commit correctly stalls there.
+    //
+    // A timeout must NEVER count. It is not a rollback: the peer may have appended the write while the reply
+    // outran the deadline (the model does exactly this). Counting one would resolve an all-timed-out write
+    // Empty and advance the frontier past a dLSN a peer later applies. The transport surfaces it as its own
+    // error code. STALE_TERM must not count either: we are deposed, and the client that replaced us may have
+    // written real data at this dLSN, so "nobody holds it" is false.
+    static constexpr auto deterministic_reject = [](std::error_condition const& e) {
+        return (e == std::make_error_condition(std::errc::invalid_argument)) ||
+            (e == make_error_condition(craft_error::REPLICA_DOWN));
+    };
+
+    std::size_t refused = 0;
+    std::error_condition last_err{};
+    for (auto const& r : *results) {
+        if (r.has_value()) continue;
+        last_err = r.error();
+        if (deterministic_reject(r.error())) ++refused;
+    }
+
+    tracker_.resolve(dlsn, (refused == replicas_.size()) ? slot_outcome::empty : slot_outcome::failed);
+    co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NO_QUORUM));
 }
 
 async_result< size_t > craft_client::read(uint64_t addr, uint64_t len, sisl::sg_list dest) {

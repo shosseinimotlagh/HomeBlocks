@@ -21,6 +21,7 @@
 // volume_handles, never the model internals, so swapping in a network shim is the only change needed.
 // All dLSN bookkeeping lives in dlsn_tracker. See README.md.
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <system_error>
@@ -58,6 +59,13 @@ public:
     int64_t read_horizon() const { return tracker_.read_horizon(); }
     // Test hook: how many reads paid for the per-block winner pass.
     uint64_t winner_scans() const { return tracker_.winner_scans(); }
+
+    // Observability: the client's dLSN watermarks + the unresolved slots pinning the frontier. Safe to call
+    // from any thread while IO is in flight. (Named dlsn_stats, not tracker_stats, so the member does not
+    // shadow the returned type inside the class scope.)
+    tracker_stats dlsn_stats(std::size_t sample_limit = 16) const { return tracker_.stats(sample_limit); }
+    std::size_t replica_count() const { return replicas_.size(); }
+    uint32_t leader_index() const { return leader_; }
 
 private:
     // The set-wide min commit_lsn floors journal reclaim on every replica. Our own frontier is an UPPER

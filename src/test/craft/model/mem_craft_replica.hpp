@@ -14,19 +14,23 @@
  *********************************************************************************/
 #pragma once
 
-// In-memory, HomeStore-free implementation of ONE CRAFT replica device -- the reference model a
-// client is built against. It owns an in-memory data journal (dLSN -> slot), an applied LBA index,
-// and derives the journal-tail overlay on demand from the unapplied journal tail. All real work is
-// synchronous under a per-replica mutex; the async_result/async_status methods are 1-line coroutine
-// wrappers that complete inline (no iomgr reactor). NOT crash-resilient and NOT performant by design.
+// In-memory, HomeStore-free implementation of ONE CRAFT replica device -- the SERVER the reference client is
+// built against. It owns an in-memory data journal (dLSN -> slot), an applied LBA index, and derives the
+// journal-tail overlay on demand from the unapplied journal tail. All real work is synchronous under a
+// per-replica mutex. NOT crash-resilient and NOT performant by design.
 //
-// Peer-to-peer concerns (leader election, login orchestration, resync, fault injection) live in
-// MemTransport (mem_craft_cluster.hpp), the in-process stand-in for the network.
+// The client-facing methods (write/read/keep_alive) are 1-line delegations across the wire, MemTransport
+// (mem_craft_cluster.hpp), the in-process stand-in for the network. Everything a network owns lives there and
+// dies with it: payload ownership (the one byte copy), deliverability (REPLICA_DOWN == "never delivered"),
+// injected latency and the op deadline. Peer-to-peer concerns (leader election, login orchestration, resync,
+// fault injection) live there too. Nothing in this file copies payload bytes.
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "craft/craft_replica.hpp" // craft_replica interface + CRAFT data types
@@ -35,9 +39,54 @@ namespace homeblocks::craft {
 
 class MemTransport; // in-process network + cold path
 
-class MemCraftReplica final : public craft_replica {
+// A read-only snapshot of one replica's CRAFT state, for observability (the craft_ublk REST endpoint and
+// the model unit test). Pure data: no HomeStore, no JSON, nothing on the protocol path reads it.
+//
+// `missing_count` counts Missing slots: dLSNs in (commit_lsn, last_append_lsn] that this replica has no
+// journal entry for. That is precisely the set apply_up_to() stalls on, so a non-zero count explains a
+// pinned commit_lsn. NOTE it stays 0 when a replica misses a *suffix* of writes (last_append_lsn simply
+// never advances), which is the common sub-quorum case; compare the LSNs against the client's watermarks
+// to see that kind of lag. A Missing slot is NOT a hole (a hole is a resolved reads-as-zero range).
+struct replica_stats {
+    peer_id_t id{};
+    std::string addr;
+    uint32_t page_size{0};
+
+    // CraftPartitionState
+    int64_t commit_lsn{-1};
+    int64_t last_append_lsn{-1};
+    uint64_t term{0};
+    uint64_t client_token{0};
+
+    // data journal
+    std::size_t journal_slots{0};
+    int64_t journal_first_dlsn{-1};
+    int64_t journal_last_dlsn{-1};
+    std::size_t zero_write_slots{0}; // all_zeros (WRITE_ZEROES); allocates nothing
+    std::size_t empty_slots{0};      // is_empty (the Empty verdict; skipped on apply)
+    uint64_t journal_data_bytes{0};  // sum(len) * page_size over data slots
+
+    std::size_t missing_count{0};
+    std::vector< int64_t > missing_sample; // ascending, capped at k_missing_sample
+
+    std::size_t mapped_blocks{0}; // index_.size(); coverage of the applied prefix
+};
+
+// enable_shared_from_this: a write the transport timed out is delivered late, from the transport's timer
+// thread. That closure must hold a WEAK reference here (a strong one would cycle: replica -> net_ -> closure
+// -> replica), so the replica must be reachable as a shared_ptr. It always is; make_mem_replica_group is the
+// only constructor caller and it uses make_shared.
+class MemCraftReplica final : public craft_replica, public std::enable_shared_from_this< MemCraftReplica > {
 public:
+    // How many Missing dLSNs stats() lists individually. The count is always exact.
+    static constexpr std::size_t k_missing_sample = 16;
+
     MemCraftReplica(replica_endpoint ep, uint32_t page_size, std::shared_ptr< MemTransport > net);
+
+    // Snapshot this replica's state. Takes mu_ and deliberately does NOT consult net_: do_write() locks
+    // the transport before mu_, so reading net_ under mu_ here would invert that order. Callers that want
+    // liveness (is_up / write_allowed) ask the transport themselves.
+    replica_stats stats() const;
 
     // ── craft_replica: client-facing ──
     async_result< LoginResult > login(uint64_t client_token) override;
@@ -71,8 +120,11 @@ private:
         std::size_t off{0};
     };
 
-    // synchronous cores (each takes mu_); the public methods co_return these inline
-    status do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list);
+    // Synchronous cores: the SERVER. Each takes mu_. Deliverability, latency and payload ownership are the
+    // transport's job (MemTransport::send_*), which is why nothing below consults net_ or copies bytes.
+    // do_write takes the payload already owned and adopts it; `bytes == nullptr` is a zero write.
+    status do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
+                    std::shared_ptr< std::vector< uint8_t > > bytes);
     result< std::vector< io_extent > > do_read(client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
                                                sisl::sg_list dest);
     result< LSNPair > do_keep_alive(client_hdr hdr);

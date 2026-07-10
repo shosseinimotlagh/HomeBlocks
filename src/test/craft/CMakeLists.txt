@@ -32,6 +32,16 @@ target_sources(craft_client PRIVATE
 )
 target_link_libraries(craft_client ${COMMON_DEPS})
 
+# ── admin: read-only REST introspection over the model + client. The ONLY user of sisl::http (httplib) and
+# nlohmann in this tree, which is why it is its own TU: the model/client objects above stay linkable without
+# them (test_craft_memory / test_craft_dlsn_tracker link without homestore at all). Built unconditionally so
+# CI compiles it even where ublkpp is absent; only craft_ublk consumes the objects.
+add_library(craft_admin OBJECT)
+target_sources(craft_admin PRIVATE
+    admin/craft_admin_http.cpp
+)
+target_link_libraries(craft_admin ${COMMON_DEPS} sisl::http)
+
 # ── tests that need no ublk device (built regardless of ublkpp) ──
 
 # Model unit test: links the HomeStore-free model objects + sisl + gtest, deliberately WITHOUT
@@ -126,14 +136,18 @@ if (UblkPP_FOUND)
         client/craft_ublk_cli.cpp
         model/mem_craft_volume.cpp
         $<TARGET_OBJECTS:craft_client>
+        $<TARGET_OBJECTS:craft_admin>
         $<TARGET_OBJECTS:craft_ublk_disk>
         $<TARGET_OBJECTS:${PROJECT_NAME}_craft_mem>
     )
     target_compile_options(craft_ublk PRIVATE -Wno-pedantic -Wno-unused-parameter)
+    # sisl::http is NOT pulled in by the sisl::sisl umbrella component; name it explicitly rather than lean on
+    # it arriving transitively through homestore -> iomgr.
     target_link_libraries(craft_ublk
         ${PROJECT_NAME}
         ${COMMON_TEST_DEPS}
         UblkPP::UblkPP
+        sisl::http
         -rdynamic
     )
 endif()

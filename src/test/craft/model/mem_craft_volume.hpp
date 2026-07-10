@@ -45,6 +45,10 @@ volume_handle create_memory_volume(volume_info info, std::shared_ptr< MemCraftRe
 struct MemReplicaHandles {
     std::vector< volume_handle > handles; // one per replica device; the client drives each separately
     std::shared_ptr< MemTransport > net;  // in-process network + cold path + faults (no production analog)
+    // Observability escape hatch, in handle order: the same replica objects the handles wrap. The craft_ublk
+    // REST endpoint reads their stats(). Nothing on the CRAFT protocol path may use this; a client only ever
+    // sees the opaque handles above.
+    std::vector< std::shared_ptr< MemCraftReplica > > replicas;
 };
 MemReplicaHandles make_memory_replica_set(volume_info info, uint32_t n = 3);
 

@@ -18,20 +18,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 namespace homeblocks::craft {
 
 namespace {
-// Copy a scatter/gather list into an owned, contiguous byte buffer (deliberately not zero-copy).
-std::shared_ptr< std::vector< uint8_t > > own_bytes(sisl::sg_list const& s) {
-    auto b = std::make_shared< std::vector< uint8_t > >();
-    b->reserve(s.size);
-    for (auto const& io : s.iovs) {
-        auto const* p = static_cast< uint8_t const* >(io.iov_base);
-        b->insert(b->end(), p, p + io.iov_len);
-    }
-    return b;
-}
 bool all_zero(uint8_t const* p, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) {
         if (p[i] != 0) return false;
@@ -59,14 +50,21 @@ async_status MemCraftReplica::logout(client_hdr hdr) {
     }
     co_return net_ ? net_->run_logout(this, hdr.term) : ok();
 }
+// Every client-facing op crosses the wire (MemTransport), which owns the payload, decides deliverability, and
+// imposes latency. What is left below is the server: journal + index. Nothing here copies bytes.
 async_status MemCraftReplica::write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list data) {
-    co_return do_write(hdr, dlsn, addr, len, std::move(data));
+    if (!net_) co_return fail(craft_error::NO_QUORUM); // no wire, nothing to deliver over
+    co_return co_await net_->send_write(this, hdr, dlsn, addr, len, std::move(data));
 }
 async_result< std::vector< io_extent > > MemCraftReplica::read(client_hdr hdr, int64_t read_lsn, uint64_t addr,
                                                                uint64_t len, sisl::sg_list dest) {
-    co_return do_read(hdr, read_lsn, addr, len, std::move(dest));
+    if (!net_) co_return fail(craft_error::NO_QUORUM);
+    co_return co_await net_->send_read(this, hdr, read_lsn, addr, len, std::move(dest));
 }
-async_result< LSNPair > MemCraftReplica::keep_alive(client_hdr hdr) { co_return do_keep_alive(hdr); }
+async_result< LSNPair > MemCraftReplica::keep_alive(client_hdr hdr) {
+    if (!net_) co_return fail(craft_error::NO_QUORUM);
+    co_return co_await net_->send_keep_alive(this, hdr);
+}
 async_result< LSNPair > MemCraftReplica::get_lsns() { co_return do_lsns(); }
 async_result< LSNPair > MemCraftReplica::get_rs_commit_lsn() { co_return do_lsns(); }
 async_result< std::vector< JournalSlot > > MemCraftReplica::fetch_data(std::vector< int64_t > lsns) {
@@ -76,11 +74,17 @@ async_status MemCraftReplica::truncate(int64_t lsn) { co_return do_truncate(lsn)
 
 // ── synchronous cores ──
 
-status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list data) {
-    if (net_ && !net_->is_up(ep_.id)) return fail(craft_error::REPLICA_DOWN);
-    if (net_ && !net_->write_allowed(ep_.id)) return fail(craft_error::REPLICA_DOWN); // sub-quorum drop
+// Takes the payload ALREADY owned: write() copied it exactly once, at issue. The journal slot adopts that
+// buffer, so nothing here copies bytes -- this is the replica persisting what the transport handed it.
+// `bytes == nullptr` is a zero write (WRITE_ZEROES), which allocates nothing.
+status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
+                                 std::shared_ptr< std::vector< uint8_t > > bytes) {
+    // Deliverability is the transport's verdict, not ours: by the time we are called, the request arrived.
     // byte-based API: addr/len must be block-aligned (the model works in page_size blocks internally).
     if (addr % page_size_ != 0 || len % page_size_ != 0 || len == 0) {
+        return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+    }
+    if (bytes && (bytes->size() != len)) {
         return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
     }
     std::lock_guard< std::mutex > g{mu_};
@@ -90,11 +94,8 @@ status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, ui
     slot.term = hdr.term;
     slot.lba = addr / page_size_;                            // byte offset -> block index
     slot.len = static_cast< lba_count_t >(len / page_size_); // byte length -> block count
-    slot.all_zeros = (data.size == 0); // empty sg_list => zero write (WRITE_ZEROES); no all_zeros flag
-    if (!slot.all_zeros) {
-        if (data.size != len) { return std::unexpected(std::make_error_condition(std::errc::invalid_argument)); }
-        slot.bytes = own_bytes(data); // own_bytes iterates all iovecs
-    }
+    slot.all_zeros = !bytes;                                 // no payload => zero write; no all_zeros flag
+    slot.bytes = std::move(bytes);                           // adopt the buffer; do not copy it again
     journal_[dlsn] = std::move(slot);
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
     apply_up_to(hdr.commit_lsn); // piggybacked commit: advance the frontier best-effort, in dLSN order
@@ -103,7 +104,6 @@ status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, ui
 
 result< std::vector< io_extent > > MemCraftReplica::do_read(client_hdr hdr, int64_t read_lsn, uint64_t addr,
                                                             uint64_t len, sisl::sg_list dest) {
-    if (net_ && !net_->is_up(ep_.id)) return fail(craft_error::REPLICA_DOWN);
     // byte-based API: addr/len block-aligned; dest is a single contiguous buffer covering [addr,addr+len)
     if (addr % page_size_ != 0 || len % page_size_ != 0 || len == 0) {
         return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
@@ -116,7 +116,6 @@ result< std::vector< io_extent > > MemCraftReplica::do_read(client_hdr hdr, int6
 }
 
 result< LSNPair > MemCraftReplica::do_keep_alive(client_hdr hdr) {
-    if (net_ && !net_->is_up(ep_.id)) return fail(craft_error::REPLICA_DOWN);
     std::lock_guard< std::mutex > g{mu_};
     // Term-fenced: a stale client must NOT reset the liveness watchdog (that would block failover).
     if (hdr.term != state_.term) return fail(craft_error::STALE_TERM);
@@ -258,6 +257,62 @@ std::vector< io_extent > MemCraftReplica::read_range(int64_t H, uint64_t addr, u
         }
     }
     return layout;
+}
+
+// ── observability ──
+
+replica_stats MemCraftReplica::stats() const {
+    std::lock_guard< std::mutex > g{mu_};
+
+    replica_stats s;
+    s.id = ep_.id;
+    s.addr = ep_.addr;
+    s.page_size = page_size_;
+    s.commit_lsn = state_.commit_lsn;
+    s.last_append_lsn = state_.last_append_lsn;
+    s.term = state_.term;
+    s.client_token = state_.client_token;
+    s.mapped_blocks = index_.size();
+
+    s.journal_slots = journal_.size();
+    if (!journal_.empty()) {
+        s.journal_first_dlsn = journal_.begin()->first;
+        s.journal_last_dlsn = journal_.rbegin()->first;
+    }
+    for (auto const& [dlsn, slot] : journal_) {
+        if (slot.is_empty) {
+            ++s.empty_slots;
+        } else if (slot.all_zeros) {
+            ++s.zero_write_slots;
+        } else {
+            s.journal_data_bytes += static_cast< uint64_t >(slot.len) * page_size_;
+        }
+    }
+
+    // Missing = the dLSNs in (commit_lsn, last_append_lsn] with no journal entry. Count them by
+    // subtraction rather than by walking the range: the uncommitted tail can be arbitrarily wide, while
+    // the slots actually present in it are bounded by the client's in-flight window.
+    int64_t const lo = state_.commit_lsn + 1;
+    int64_t const hi = state_.last_append_lsn;
+    if (hi >= lo) {
+        auto const first = journal_.lower_bound(lo);
+        auto const last = journal_.upper_bound(hi);
+        auto const present = static_cast< std::size_t >(std::distance(first, last));
+        s.missing_count = static_cast< std::size_t >(hi - lo + 1) - present;
+
+        // Sample the gaps in one pass over the same range, bounded so a missing tail cannot run long.
+        int64_t expect = lo;
+        for (auto it = first; it != last && s.missing_sample.size() < k_missing_sample; ++it) {
+            for (; expect < it->first && s.missing_sample.size() < k_missing_sample; ++expect) {
+                s.missing_sample.push_back(expect);
+            }
+            expect = it->first + 1;
+        }
+        for (; expect <= hi && s.missing_sample.size() < k_missing_sample; ++expect) {
+            s.missing_sample.push_back(expect);
+        }
+    }
+    return s;
 }
 
 // ── cold-path hooks (driven by MemTransport, which does NOT hold its own lock while calling these) ──

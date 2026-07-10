@@ -19,8 +19,12 @@
 // sequencing logic before any /dev/ublkbN validation. n=1 is the current stepping stone; n=3 (with
 // force_subquorum) exercises the quorum path the next step builds on.
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <boost/uuid/uuid_generators.hpp>
@@ -237,6 +241,138 @@ TEST(CraftClient, RecoveryLoginReadsDurableDataNotZeros) {
     EXPECT_EQ(fresh->commit_lsn(), 1);
     EXPECT_EQ(fresh->read_horizon(), 1);
     EXPECT_EQ(rd(*fresh, 2), buf);
+}
+
+// --- quorum ack: the write must not wait for the slowest replica ---
+
+// A straggler delayed far past the transport deadline costs the write NOTHING: the other two ack, quorum is
+// met, and write() returns while that peer is still in flight. Without when_quorum this would block for the
+// full op_timeout on every write.
+TEST(CraftClient, N3_WriteAcksAtQuorumWithoutWaitingForAStraggler) {
+    auto cl = make_cluster(3);
+    cl.set.net->set_op_timeout(std::chrono::milliseconds{2000});
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 2), std::chrono::milliseconds{2000});
+
+    auto buf = page_of(0x7C);
+    auto const t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(wr(*cl.client, 4, buf)) << "quorum(3)=2 met by the two healthy replicas";
+    auto const elapsed = std::chrono::steady_clock::now() - t0;
+
+    EXPECT_LT(elapsed, std::chrono::milliseconds{1000}) << "returned at quorum, not at the deadline";
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "slot resolved acked; the frontier advanced";
+}
+
+// The straggler's write must land with the bytes as of ISSUE time, not as of delivery time. This pins the
+// payload-ownership contract in craft_replica.hpp: the client acks at quorum and the caller is then free to
+// recycle its buffer, so a replica that kept the caller's sg_list across its sleep would deliver whatever the
+// caller wrote there next. Overwriting the live buffer (rather than freeing it) makes that deterministic --
+// a use-after-free would merely read stale-but-correct bytes and pass.
+TEST(CraftClient, N3_StragglerWriteLandsIntactAfterTheClientReturned) {
+    auto cl = make_cluster(3);
+    cl.set.net->set_op_timeout(std::chrono::milliseconds{20});
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 2), std::chrono::milliseconds{200});
+
+    auto buf = page_of(0x5E);
+    ASSERT_TRUE(wr(*cl.client, 6, buf)) << "acks at quorum while replica 2 is still in flight";
+    ASSERT_EQ(cl.set.replicas[2]->stats().journal_slots, 0u) << "not delivered yet";
+
+    // The caller recycles its buffer the instant the write acks. The in-flight straggler must not see this.
+    std::fill(buf.begin(), buf.end(), 0xFF);
+
+    // Lift the delay so the verifying read below is not itself timed out. The late write was already
+    // scheduled with its own deadline, so it still arrives late.
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 2), std::chrono::milliseconds{0});
+
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while ((cl.set.replicas[2]->stats().journal_slots == 0u) && (std::chrono::steady_clock::now() < deadline)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    ASSERT_EQ(cl.set.replicas[2]->stats().journal_slots, 1u) << "the peer applied it after the deadline";
+
+    // Read it back straight off the straggler at the write's horizon; the bytes must be intact.
+    auto& r = *cl.set.replicas[2];
+    std::vector< uint8_t > dest(PAGE, 0xEE);
+    auto const out = rg(r.read(chdr(cl.client->term(), /*commit*/ 0), /*H*/ 0, blk(6), blk(1), one_iov(dest)));
+    ASSERT_TRUE(out.has_value());
+    EXPECT_FALSE((*out)[0].hole);
+    EXPECT_EQ(dest, page_of(0x5E)) << "payload survived; the replica copied it at issue, not after its sleep";
+}
+
+// --- Empty: provably absent set-wide ---
+
+// Every replica rejects deterministically (never delivered => never appended), so nobody holds the slot. It
+// is a permanent no-op: Empty, not failed. An unresolved slot here would pin the frontier forever, because
+// nothing will ever fill or Empty a dLSN that does not exist anywhere.
+TEST(CraftClient, N3_AllReplicasRefuseResolvesEmptyAndReleasesTheFrontier) {
+    auto cl = make_cluster(3);
+    auto buf = page_of(1);
+    ASSERT_TRUE(wr(*cl.client, 1, buf)); // dLSN 0 commits normally
+    EXPECT_EQ(cl.client->commit_lsn(), 0);
+
+    cl.set.net->force_subquorum({}); // keep nobody: all three reject with REPLICA_DOWN
+    EXPECT_FALSE(wr(*cl.client, 2, buf));
+    cl.set.net->clear_faults();
+
+    EXPECT_EQ(cl.client->commit_lsn(), 1) << "dLSN 1 is Empty: a resolved no-op the frontier passes over";
+}
+
+// Contrast: the leader physically journals the slot, so it is NOT provably absent. The slot stays unresolved
+// and correctly pins the frontier until a leader resolution round fills or Empties it.
+TEST(CraftClient, N3_PartialRefusalPinsTheFrontier) {
+    auto cl = make_cluster(3);
+    auto buf = page_of(1);
+    ASSERT_TRUE(wr(*cl.client, 1, buf));
+    EXPECT_EQ(cl.client->commit_lsn(), 0);
+
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)}); // the leader still holds it
+    EXPECT_FALSE(wr(*cl.client, 2, buf));
+    cl.set.net->clear_faults();
+
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "some replica may hold dLSN 1; commit must stall under it";
+}
+
+// --- the multi-queue model: K threads share one craft_client ---
+//
+// ublk picks a queue by CPU, not by LBA, so any LBA can arrive on any queue thread, and all of them drive
+// ONE craft_client against ONE partition's dLSN space. That is the concurrency the tracker's atomics exist
+// for, and nothing exercised it through craft_client until MemTransport stopped completing ops inline: the
+// fan-out used to run sequentially on the issuing thread and when_quorum never even suspended.
+//
+// Run this under TSAN. It is the test that says the client survives a real transport's execution model.
+TEST(CraftClient, N3_ConcurrentWritersFromManyThreads) {
+    constexpr uint32_t kThreads = 4;
+    constexpr uint32_t kWritesPerThread = 25;
+    constexpr uint64_t kBlocks = uint64_t{kThreads} * kWritesPerThread;
+
+    auto cl = make_cluster(3);
+    std::vector< std::thread > writers;
+    std::atomic< uint32_t > failures{0};
+
+    for (uint32_t t = 0; t < kThreads; ++t) {
+        writers.emplace_back([&, t] {
+            for (uint32_t i = 0; i < kWritesPerThread; ++i) {
+                auto const blk_idx = (t * kWritesPerThread) + i;
+                auto buf = page_of(static_cast< uint8_t >(blk_idx & 0xFF));
+                if (!wr(*cl.client, blk_idx, buf)) ++failures;
+            }
+        });
+    }
+    for (auto& w : writers) {
+        w.join();
+    }
+    EXPECT_EQ(failures.load(), 0u) << "every write reached quorum";
+
+    // Each write took a distinct dLSN, and with all of them acked the frontier must have folded over the
+    // whole contiguous range. Nothing may remain unresolved once every writer has joined.
+    auto const s = cl.client->dlsn_stats();
+    EXPECT_EQ(s.issued, static_cast< int64_t >(kBlocks) - 1);
+    EXPECT_EQ(s.frontier, s.issued) << "the contiguous prefix folded over every acked slot";
+    EXPECT_EQ(s.unresolved_count, 0u);
+
+    // And every block reads back what its owning thread wrote: no lost or crossed dLSN.
+    for (uint64_t b = 0; b < kBlocks; ++b) {
+        EXPECT_EQ(rd(*cl.client, b), page_of(static_cast< uint8_t >(b & 0xFF))) << "block " << b;
+    }
 }
 
 int main(int argc, char* argv[]) {

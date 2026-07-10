@@ -22,8 +22,10 @@
 //   sudo ./craft_ublk --vol_size_mb 4096 --replicas 1 --num_threads 4
 //
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <random>
@@ -37,9 +39,11 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 
+#include <sisl/http/http_server.hpp> // sisl::HttpServer (stop() on shutdown)
 #include <ublkpp/target.hpp>
 #include <homeblks/home_blocks.hpp>
 
+#include "admin/craft_admin_http.hpp" // start_admin_http, volume_geometry
 #include "model/mem_craft_volume.hpp" // make_memory_replica_set
 #include "craft_ublk_disk.hpp"
 #include "craft_client.hpp"
@@ -59,7 +63,13 @@ SISL_OPTION_GROUP(craft_ublk,
                   (num_threads, "", "num_threads", "iomgr reactor count",
                    ::cxxopts::value< uint32_t >()->default_value("2"), "<n>"),
                   (device_id, "", "device_id", "ublk device id: -1 to assign, >=0 to recover a preserved device",
-                   ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"))
+                   ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"),
+                  (http_port, "", "http_port", "Read-only REST introspection port (0 disables)",
+                   ::cxxopts::value< uint32_t >()->default_value("0"), "<port>"),
+                  (op_timeout_ms, "", "op_timeout_ms",
+                   "Transport op timeout in ms (0 = wait forever). A replica delayed past this is abandoned by "
+                   "the client, which then commits at quorum; the peer still applies the write later",
+                   ::cxxopts::value< uint32_t >()->default_value("0"), "<ms>"))
 
 // `homeblocks` is a logging module. The in-memory model + public API live in libhomeblocks, but we never
 // call init_homeblocks (no HomeStore), so the static archive does not pull in the module's definition --
@@ -139,7 +149,30 @@ int main(int argc, char* argv[]) {
         auto const max_inflight = static_cast< uint32_t >(SISL_OPTIONS["nr_hw_queues"].as< uint16_t >()) *
             static_cast< uint32_t >(SISL_OPTIONS["qdepth"].as< uint16_t >());
 
+        // volume_info is move-only and make_memory_replica_set consumes it, so snapshot the geometry the
+        // REST endpoint reports before handing it over.
+        craft::volume_geometry geo{info.id, info.name, info.size_bytes, info.page_size};
+
         auto set = craft::make_memory_replica_set(std::move(info), replicas);
+        auto mem_replicas = set.replicas; // observability handles; see MemReplicaHandles
+        auto net = set.net;
+
+        // The transport's deadline. Without it a delayed replica merely slows the client; with it the client
+        // abandons the straggler and commits at quorum, and the straggler still applies the write later.
+        if (auto const t = SISL_OPTIONS["op_timeout_ms"].as< uint32_t >(); t != 0) {
+            net->set_op_timeout(std::chrono::milliseconds{t});
+            LOGINFO("CRAFT transport op timeout: {} ms", t);
+        }
+
+        // The model completes every op on one of its own service threads, because that is what a network
+        // does and the client must be correct under it. Those threads are not iomgr reactors, though, and
+        // the completion chain ends in post_msg_ring() on the ublk queue ring, which needs a uring thread.
+        // Dispatch completions onto a worker reactor so the fast path stays; the model stays iomgr-free.
+        // A real transport reaps its own CQEs on the issuing queue thread and needs none of this.
+        net->set_completion_executor([](std::function< void() > fn) {
+            iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [f = std::move(fn)]() mutable { f(); });
+        });
+
         auto client = std::make_shared< craft::craft_client >(std::move(set.handles), 0, max_inflight);
 
         auto login_res = detail::sync_get(client->login(random_token()));
@@ -149,6 +182,14 @@ int main(int argc, char* argv[]) {
             return EIO;
         }
         LOGINFO("CRAFT login ok: {} replica(s), term={}, lba_size={}", replicas, client->term(), client->lba_size());
+
+        // Read-only introspection: watch the commit frontier advance while fio drives the device.
+        std::shared_ptr< sisl::HttpServer > admin;
+        if (auto const port = SISL_OPTIONS["http_port"].as< uint32_t >(); port != 0) {
+            admin = craft::start_admin_http(static_cast< uint16_t >(port), client, mem_replicas, net, std::move(geo));
+            LOGINFO("CRAFT admin REST on http://127.0.0.1:{}/api/v1/status", port);
+            std::cout << "CRAFT admin REST at: http://127.0.0.1:" << port << "/api/v1/status" << std::endl;
+        }
 
         auto disk = std::make_shared< ublk::CraftUblkDisk >(client, vid, capacity, page_size, max_tx);
         auto run = ublkpp::ublkpp_tgt::run(vid, std::move(disk), SISL_OPTIONS["device_id"].as< int32_t >());
@@ -163,6 +204,12 @@ int main(int argc, char* argv[]) {
         } else {
             LOGERROR("ublkpp_tgt::run failed: {}", run.error().message());
             rc = EIO;
+        }
+
+        // Join the HTTP thread before the client and replica set its handlers reference go out of scope.
+        if (admin) {
+            LOGINFO("Stopping CRAFT admin REST");
+            admin->stop();
         }
     }
 

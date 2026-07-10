@@ -29,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <variant>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 #include <sisl/async/shared_awaitable.hpp>
@@ -97,6 +98,18 @@ struct read_segment {
 };
 using read_plan = boost::container::small_vector< read_segment, 4 >;
 
+// A read-only snapshot of the client's dLSN bookkeeping, for observability. `unresolved_count` is the
+// number of slots in (frontier, issued] that are neither acked nor Empty: the in_flight writes plus any
+// that failed to reach quorum. Those slots are what pin the frontier below `issued`.
+struct tracker_stats {
+    int64_t frontier{-1};      // F == the client's commit_lsn
+    int64_t highest_acked{-1}; // Ha
+    int64_t issued{-1};        // highest dLSN handed out (next_dlsn_ - 1)
+    std::size_t unresolved_count{0};
+    std::vector< int64_t > unresolved_sample; // ascending, capped at the caller's sample_limit
+    uint64_t winner_scans{0};
+};
+
 class dlsn_tracker {
 public:
     // `max_inflight` is an opaque IO-concurrency bound; it only sizes the winner-scan tripwire. Nothing
@@ -122,6 +135,11 @@ public:
 
     // Test hook: how many reads paid for the per-block winner pass.
     uint64_t winner_scans() const { return winner_scans_.load(std::memory_order_relaxed); }
+
+    // Snapshot the watermarks and the unresolved slots between them. Costs O(#unresolved), not O(issued - F),
+    // because it hops gap to gap through completed_upto(). `sample_limit` bounds only the listed dLSNs; the
+    // count is always exact. Safe from any thread (atomics + StreamTracker's shared lock).
+    tracker_stats stats(std::size_t sample_limit) const;
 
 private:
     // An empty plan means the range is fenced: by an in_flight slot (retry after the next resolve) or by a

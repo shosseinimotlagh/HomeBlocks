@@ -15,21 +15,11 @@
 #pragma once
 
 // CraftUblkDisk: a ublkpp leaf disk (ublkpp::ublk_disk) that exposes a CRAFT volume as a ublk block
-// device (/dev/ublkbN). It is a fork of HomeBlkDisk onto the CRAFT client surface: instead of calling
-// the (deprecated) byte-block async_read/async_write on a single volume_handle, it drives a craft_client
-// (login / dLSN-stamped broadcast writes / horizon reads) that sits over one-or-more replica handles.
+// device (/dev/ublkbN). It drives a craft_client (login / dLSN-stamped broadcast writes / horizon reads) that sits over
+// one-or-more replica handles.
 //
-// The thread bridge is IDENTICAL to HomeBlkDisk and reused on purpose -- it is the execution model the
-// real (network-shim-backed) driver needs, not a memory-only shortcut:
-//   - ublkpp drives each ublk queue on its own pthread with a SINGLE_ISSUER io_uring; a driver's async_iov
-//     coroutine runs there and its per-IO ublkpp::cqe_state must be resumed ON THE QUEUE THREAD.
-//   - the CRAFT client op is launched ON a worker reactor (run_on_forget) so it runs where async storage /
-//     (eventually) network completions live; when it completes the result is handed straight to the ublk
-//     queue's io_uring via IORING_OP_MSG_RING (iomanager.post_msg_ring). The queue thread's run_queue_loop
-//     reaps that CQE like a native completion and resumes the per-IO coroutine. No eventfd, no lock.
-//
-// This first cut targets a single in-memory replica: correctness/crash validation of the I/O path. Zero
-// writes (DISCARD / WRITE_ZEROES) are deferred; the op is rejected in async_iov (as HomeBlkDisk does).
+// This first cut targets an in-memory replica: correctness/crash validation of the I/O path. Zero
+// writes (DISCARD / WRITE_ZEROES) are deferred; the op is rejected in async_iov
 
 #include <cstdint>
 #include <memory>

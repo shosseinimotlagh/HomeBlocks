@@ -117,6 +117,29 @@ void dlsn_tracker::advance_frontier() {
     }
 }
 
+tracker_stats dlsn_tracker::stats(std::size_t sample_limit) const {
+    tracker_stats s;
+    s.winner_scans = winner_scans_.load(std::memory_order_relaxed);
+    s.frontier = frontier_.load(std::memory_order_acquire);
+    s.highest_acked = highest_acked_.load(std::memory_order_acquire);
+    if (!tracker_) return s; // pre-login: no window to scan
+    s.issued = next_dlsn_.load(std::memory_order_acquire) - 1;
+
+    // Hop gap to gap, exactly as compute() does: completed_upto(h) is the last index of the contiguous
+    // completed (== RESOLVED) run at or above h, so the slot just past it is the next unresolved one. Clamp
+    // against `issued` because _upto() reports the last ALLOCATED slot when every bit it scanned was set.
+    // Starting at F + 1 is safe: truncate only ever runs to a published frontier, so the window base never
+    // rises above F + 1. Concurrent resolves only shrink what we find, never invent a hole.
+    for (int64_t h = s.frontier + 1; h <= s.issued;) {
+        int64_t const u = std::min(tracker_->completed_upto(h), s.issued) + 1;
+        if (u > s.issued) break; // everything from h up is resolved
+        ++s.unresolved_count;
+        if (s.unresolved_sample.size() < sample_limit) s.unresolved_sample.push_back(u);
+        h = u + 1; // u >= h always, so this strictly advances
+    }
+    return s;
+}
+
 dlsn_tracker::plan_outcome dlsn_tracker::compute(uint64_t addr, uint64_t len) {
     int64_t const F = frontier_.load(std::memory_order_acquire);
     int64_t const Ha = highest_acked_.load(std::memory_order_acquire);

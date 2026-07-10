@@ -32,9 +32,11 @@ MemReplicaHandles make_memory_replica_set(volume_info info, uint32_t n) {
     out.handles.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
         // One volume_handle per replica device -- the same shape create_volume yields per server.
+        // create_memory_volume takes its replica by value, so the group keeps its own reference.
         volume_info vi{info.id, info.size_bytes, info.page_size, info.name};
         out.handles.push_back(create_memory_volume(std::move(vi), group.replicas[i]));
     }
+    out.replicas = std::move(group.replicas); // observability only; see MemReplicaHandles
     return out;
 }
 

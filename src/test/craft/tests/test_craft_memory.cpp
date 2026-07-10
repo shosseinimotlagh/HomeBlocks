@@ -24,8 +24,10 @@
 // commit_lsn, all_committed_lsn}; commit_lsn (-1 = don't advance) piggybacks the frontier -- there is no
 // standalone commit verb. keep_alive is the dedicated commit carrier and is term-fenced.
 
+#include <chrono>
 #include <cstdint>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -364,4 +366,172 @@ TEST(CraftMemModel, LogoutIsTermFenced) {
     // Session is still alive; a write with the real term still works.
     auto buf = page_of(1);
     EXPECT_TRUE(rg(g.replicas[0]->write(chdr(term), 0, blk(5), blk(1), one_iov(buf))).has_value());
+}
+
+// --- latency injection: the straggler replica ---
+
+// Poll `fn` until it holds or `budget` elapses. Delays are wall-clock, so assert on the reached state
+// rather than on a sleep being long enough.
+template < class Fn >
+bool eventually(Fn fn, std::chrono::milliseconds budget = std::chrono::seconds{5}) {
+    auto const deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (fn()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    return fn();
+}
+
+// 20. A delay below the timeout just makes the op slow: it still succeeds, and it still lands.
+TEST(CraftMemModel, DelayBelowTimeoutMerelySlowsTheOp) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto& r = *g.replicas[0];
+    g.net->set_op_timeout(std::chrono::milliseconds{500});
+    g.net->set_delay(r.id(), std::chrono::milliseconds{20});
+
+    auto buf = page_of(9);
+    auto const t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(rg(r.write(chdr(term), 0, blk(1), blk(1), one_iov(buf))).has_value());
+    EXPECT_GE(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds{20});
+    EXPECT_EQ(r.stats().last_append_lsn, 0);
+}
+
+// 21. A delay PAST the transport's timeout: the caller is told timed_out, but the peer still receives and
+//     applies the write. This is what an RPC deadline does, and it is what lets a later write land first.
+TEST(CraftMemModel, DelayPastTimeoutTimesOutButStillLandsLater) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto& r = *g.replicas[0];
+    g.net->set_op_timeout(std::chrono::milliseconds{10});
+    g.net->set_delay(r.id(), std::chrono::milliseconds{150});
+
+    auto buf = page_of(9);
+    auto const w = rg(r.write(chdr(term), 0, blk(1), blk(1), one_iov(buf)));
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), std::make_error_condition(std::errc::timed_out));
+    EXPECT_EQ(r.stats().journal_slots, 0u) << "not delivered yet";
+
+    // The peer processed it anyway, once the full delay elapsed.
+    EXPECT_TRUE(eventually([&] { return r.stats().journal_slots == 1u; }));
+    EXPECT_EQ(r.stats().last_append_lsn, 0);
+}
+
+// 22. The payoff: a write timed out while delayed lands AFTER a later write issued once the delay is
+//     cleared, so the straggler's journal fills out of order and a Missing slot appears -- then drains
+//     when the late write finally arrives. force_subquorum can never show the drain: it never delivers.
+TEST(CraftMemModel, ClearingADelayLeavesAMissingSlotThatDrains) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto& r = *g.replicas[0];
+    g.net->set_op_timeout(std::chrono::milliseconds{10});
+
+    auto buf = page_of(9);
+    ASSERT_TRUE(rg(r.write(chdr(term), 0, blk(1), blk(1), one_iov(buf))).has_value()); // dLSN 0 lands now
+
+    g.net->set_delay(r.id(), std::chrono::milliseconds{300});
+    auto const slow = rg(r.write(chdr(term), 1, blk(2), blk(1), one_iov(buf))); // dLSN 1 times out
+    ASSERT_FALSE(slow.has_value());
+
+    g.net->set_delay(r.id(), std::chrono::milliseconds{0});                            // straggler recovers
+    ASSERT_TRUE(rg(r.write(chdr(term), 2, blk(3), blk(1), one_iov(buf))).has_value()); // dLSN 2 lands now
+    ASSERT_TRUE(rg(r.keep_alive(chdr(term, 2))).has_value());
+
+    { // dLSN 1 is still in the transport: the journal has a hole and the frontier is pinned under it.
+        auto const s = r.stats();
+        EXPECT_EQ(s.commit_lsn, 0);
+        EXPECT_EQ(s.last_append_lsn, 2);
+        EXPECT_EQ(s.missing_count, 1u);
+        EXPECT_EQ(s.missing_sample, std::vector< int64_t >{1});
+    }
+
+    // It arrives; the gap closes. A commit carrier is what actually advances the frontier over it.
+    ASSERT_TRUE(eventually([&] { return r.stats().missing_count == 0u; }));
+    ASSERT_TRUE(rg(r.keep_alive(chdr(term, 2))).has_value());
+    auto const s = r.stats();
+    EXPECT_EQ(s.journal_slots, 3u);
+    EXPECT_EQ(s.commit_lsn, 2) << "frontier catches up once the hole is filled";
+    EXPECT_EQ(s.mapped_blocks, 3u);
+}
+
+// --- stats(): the observability snapshot behind craft_ublk's REST endpoint ---
+
+// 17. Missing slots are the dLSNs in (commit_lsn, last_append_lsn] with no journal entry -- exactly what
+//     apply_up_to stalls on. Here dLSN 1 never arrives, so the frontier pins at 0 while the tail runs to 3.
+TEST(CraftMemModel, StatsReportsMissingSlots) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto& r = *g.replicas[0];
+    auto buf = page_of(3);
+    ASSERT_TRUE(rg(r.write(chdr(term), 0, blk(5), blk(1), one_iov(buf))).has_value());
+    ASSERT_TRUE(rg(r.write(chdr(term), 2, blk(6), blk(1), one_iov(buf))).has_value()); // gap at dLSN 1
+    ASSERT_TRUE(rg(r.write(chdr(term), 3, blk(7), blk(1), one_iov(buf))).has_value());
+    ASSERT_TRUE(rg(r.keep_alive(chdr(term, 3))).has_value());
+
+    auto const s = r.stats();
+    EXPECT_EQ(s.id, r.id());
+    EXPECT_EQ(s.page_size, PAGE);
+    EXPECT_EQ(s.term, term);
+    EXPECT_EQ(s.client_token, TOKEN);
+
+    EXPECT_EQ(s.commit_lsn, 0); // stalled below the missing dLSN 1
+    EXPECT_EQ(s.last_append_lsn, 3);
+    EXPECT_EQ(s.missing_count, 1u);
+    EXPECT_EQ(s.missing_sample, std::vector< int64_t >{1});
+
+    EXPECT_EQ(s.journal_slots, 3u); // 0, 2, 3 -- nothing reclaims below the frontier here
+    EXPECT_EQ(s.journal_first_dlsn, 0);
+    EXPECT_EQ(s.journal_last_dlsn, 3);
+    EXPECT_EQ(s.journal_data_bytes, 3ull * PAGE);
+    EXPECT_EQ(s.mapped_blocks, 1u); // only dLSN 0 (block 5) was applied
+}
+
+// 18. The count stays exact past the sample cap: a wide gap must not make stats() walk the whole range.
+TEST(CraftMemModel, StatsMissingSampleIsCappedButCountIsExact) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto& r = *g.replicas[0];
+    auto buf = page_of(3);
+    ASSERT_TRUE(rg(r.write(chdr(term), 0, blk(5), blk(1), one_iov(buf))).has_value());
+    ASSERT_TRUE(rg(r.write(chdr(term), 100, blk(6), blk(1), one_iov(buf))).has_value());
+    ASSERT_TRUE(rg(r.keep_alive(chdr(term, 100))).has_value());
+
+    auto const s = r.stats();
+    EXPECT_EQ(s.commit_lsn, 0);
+    EXPECT_EQ(s.last_append_lsn, 100);
+    EXPECT_EQ(s.missing_count, 99u); // dLSN 1..99
+    ASSERT_EQ(s.missing_sample.size(), MemCraftReplica::k_missing_sample);
+    EXPECT_EQ(s.missing_sample.front(), 1);
+    EXPECT_EQ(s.missing_sample.back(), static_cast< int64_t >(MemCraftReplica::k_missing_sample));
+}
+
+// 19. A zero write is a journal slot that carries no bytes and unmaps its range on apply, so it shows up in
+//     zero_write_slots, contributes nothing to journal_data_bytes, and shrinks mapped_blocks.
+TEST(CraftMemModel, StatsCountsZeroWritesAndMappedBlocks) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto& r = *g.replicas[0];
+
+    auto data = page_of(7, 2); // blocks 4 and 5
+    ASSERT_TRUE(rg(r.write(chdr(term), 0, blk(4), blk(2), one_iov(data))).has_value());
+    ASSERT_TRUE(rg(r.keep_alive(chdr(term, 0))).has_value());
+    {
+        auto const s = r.stats();
+        EXPECT_EQ(s.commit_lsn, 0);
+        EXPECT_EQ(s.missing_count, 0u);
+        EXPECT_EQ(s.zero_write_slots, 0u);
+        EXPECT_EQ(s.mapped_blocks, 2u);
+        EXPECT_EQ(s.journal_data_bytes, 2ull * PAGE);
+    }
+
+    ASSERT_TRUE(rg(r.write(chdr(term), 1, blk(4), blk(1), sisl::sg_list{})).has_value()); // zero write
+    ASSERT_TRUE(rg(r.keep_alive(chdr(term, 1))).has_value());
+
+    auto const s = r.stats();
+    EXPECT_EQ(s.commit_lsn, 1);
+    EXPECT_EQ(s.journal_slots, 2u);
+    EXPECT_EQ(s.zero_write_slots, 1u);
+    EXPECT_EQ(s.empty_slots, 0u);
+    EXPECT_EQ(s.journal_data_bytes, 2ull * PAGE); // the zero write adds none
+    EXPECT_EQ(s.mapped_blocks, 1u);               // block 4 unmapped; block 5 remains
 }
