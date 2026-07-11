@@ -223,9 +223,12 @@ client's per-member model (its `synced`, the reclaim floor), not just writes and
 response-side mirror of the client watermarks (`commit_lsn`, `all_committed_lsn`) every IO request carries.
 
 Response body: `extent_count` extent descriptors (ascending by `addr`), **then** the concatenated data bytes
-for the non-hole extents in the same order. The descriptors come first on purpose: the receiver reads the
-layout, computes the destination iovecs (data extents map to their `dest` sub-ranges, holes are zero-filled),
-and receives the data directly into `dest` -- a zero-copy scatter that reconstructs the caller's buffer.
+for the non-hole extents in the same order. The descriptors come first on purpose: the receiver builds an
+iovec per data extent pointing at that extent's sub-range of `dest` and does one **scatter recv**, so the
+packed wire bytes land at their `dest` offsets in a single copy with no separate reassembly; the hole ranges
+are the gaps the iovecs do not cover and are zero-filled locally, so no zero bytes cross the wire. (Over
+kernel TCP that recv copy is unavoidable, so a read is single-copy, not zero-copy; only RDMA, writing each
+extent straight into `dest`, makes a read zero-copy too -- see `transport.md`.)
 
 Extent descriptor (24 bytes):
 
@@ -310,13 +313,16 @@ On the wire a framed message is therefore:
 `[message header][op header][HDGST?][body][DDGST?]`, with the two digests present per the connection's
 negotiation.
 
-### Zero-copy
+### Payload movement
 
-- **WRITE request**: build `[message header][op header]` in a small scratch, and gather-send it with the data
-  iovec pointing straight at the ublk buffer (`SEND_ZC`); the payload is consumed at submit, so a straggler
-  send outliving the quorum ack is safe (requirement 6).
-- **READ response**: read the header and the extent descriptors, compute the `dest` iovecs, then receive the
-  data directly into `dest`. The payload is never copied for the sake of the format.
+- **WRITE request**: build `[message header][op header]` in a small scratch and gather-send it with the data
+  iovec pointing straight at the ublk buffer (`SEND_ZC`), so the block payload leaves **zero-copy**; it is
+  consumed at submit, so a straggler send outliving the quorum ack is safe (requirement 6).
+- **READ response**: build an iovec per data extent (into the matching `dest` sub-ranges) and do one scatter
+  recv, so the packed wire bytes are placed at their `dest` offsets in a **single copy, with no reassembly**;
+  hole ranges are zero-filled locally. A kernel-TCP recv always copies socket buffer to userspace, so a read
+  is single-copy, not zero-copy -- RDMA (writing each extent straight into the registered `dest`) is what
+  makes a read zero-copy too.
 
 ## Sizing and limits
 
