@@ -448,6 +448,38 @@ TEST(ReadRouteMap, RecordFoldEligible) {
     EXPECT_FALSE(m.caught_up(2));
 }
 
+// The recovery seam in isolation: advance_synced (fed by the broadcast keep_alive) advances the per-member
+// commit_lsn -> the set-wide reclaim floor, and erases Missing entries the member has applied. End to end the
+// erase is dormant (a laggard's commit_lsn stalls below its hole until resync fills it), so drive it directly:
+// hand the map each member's commit_lsn as if recovery had caught member 2 up.
+TEST(ReadRouteMap, AdvanceSyncedLiftsFloorAndClearsMiss) {
+    craft::read_route_map m;
+    m.reset(3, /*L=*/-1);
+    EXPECT_EQ(m.all_committed(), -1) << "floor starts at the login baseline";
+
+    // Member 2 misses dLSN 0 on block 3; fold it into the map.
+    m.create(0, blk(3), PAGE);
+    m.record_completion(0, 0, true);
+    m.record_completion(0, 1, true);
+    m.record_completion(0, 2, false);
+    m.fold_to(0);
+    EXPECT_FALSE(m.caught_up(2));
+    EXPECT_FALSE(m.eligible(2, blk(3), PAGE, 0));
+    EXPECT_EQ(m.all_committed(), -1) << "no commit_lsn learned yet";
+
+    // The floor is the MIN across members, so the laggard pins it below the caught-up ones: members 0 and 1
+    // race ahead to dLSN 5, but the floor stays at the baseline until member 2 reports, then tracks member 2.
+    m.advance_synced(0, 5);
+    m.advance_synced(1, 5);
+    EXPECT_EQ(m.all_committed(), -1) << "member 2 still at the baseline pins the floor, not the leaders' 5";
+    m.advance_synced(2, 0);
+    EXPECT_EQ(m.all_committed(), 0) << "floor tracks the laggard (0), not the caught-up members (5)";
+
+    // Member 2's commit_lsn passing dLSN 0 means it applied block 3 (resync filled the hole) -> miss cleared.
+    EXPECT_TRUE(m.caught_up(2));
+    EXPECT_TRUE(m.eligible(2, blk(3), PAGE, 0));
+}
+
 // The per-block win: a member missing block X still serves reads of a block Y it holds. Under the old scalar
 // a single miss sidelined a member from EVERY sub-frontier read; the LBA-range Missing map only routes it
 // around the blocks it actually missed.
@@ -608,6 +640,117 @@ TEST(CraftClient, BehindMemberIsRoutedAround) {
     EXPECT_FALSE(cl.client->route_caught_up(2)) << "follower 2 missed the acked write; behind the frontier";
     EXPECT_TRUE(cl.client->route_caught_up(0)) << "leader held it; still caught up";
     EXPECT_TRUE(cl.client->route_caught_up(1)) << "follower 1 held it; still caught up";
+}
+
+// Broadcast keep_alive learns every member's achieved commit_lsn and advances the set-wide reclaim floor
+// (min across members). Healthy: all members apply up to the frontier, so the floor equals it.
+TEST(CraftClient, KeepAliveAdvancesReclaimFloor) {
+    auto cl = make_cluster(3);
+    int64_t const base = cl.client->all_committed_lsn(); // login baseline, before any keep_alive
+    for (uint64_t b = 0; b < 4; ++b) {
+        auto v = page_of(static_cast< uint8_t >(0x40 + b));
+        ASSERT_TRUE(wr(*cl.client, b, v));
+    }
+    // Writes advance the client frontier, but a member only applies up to the commit_lsn piggybacked on the
+    // IO it saw; the broadcast keep_alive carries the latest frontier to everyone and reads back their commit.
+    ASSERT_TRUE(rg(cl.client->flush()).has_value());
+
+    int64_t const F = cl.client->commit_lsn();
+    EXPECT_GT(cl.client->all_committed_lsn(), base);
+    EXPECT_EQ(cl.client->all_committed_lsn(), F) << "healthy: every member applied up to the frontier";
+    for (uint32_t i = 0; i < 3; ++i)
+        EXPECT_EQ(cl.set.replicas[i]->stats().commit_lsn, F);
+}
+
+// The reclaim floor is pinned by the member that is BEHIND, not by the frontier: it is the min commit_lsn
+// across members, so a member that has not caught up holds it down -- exactly what keeps a peer's still-needed
+// journal from being reclaimed. (Sending our own frontier as the floor, as the placeholder -1 avoided, would
+// break this.) Member 2 is excluded from every write, so it deterministically holds nothing and never leaves
+// the login baseline while the other two advance -- the precise per-dLSN min is unit-tested separately.
+TEST(CraftClient, ReclaimFloorPinnedByBehindMember) {
+    auto cl = make_cluster(3);
+    // Members 0 and 1 are the required quorum for every write (both must ack, so neither straggles); member 2
+    // is excluded throughout and holds nothing.
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0), craft::mem_replica_id(cl.vid, 1)});
+    for (uint64_t b = 0; b < 3; ++b) {
+        auto v = page_of(static_cast< uint8_t >(0xA0 + b));
+        ASSERT_TRUE(wr(*cl.client, b, v)); // dLSN b: 0,1 hold; member 2 misses it
+    }
+    cl.set.net->clear_faults();
+    ASSERT_TRUE(rg(cl.client->flush()).has_value());
+
+    int64_t const F = cl.client->commit_lsn();
+    EXPECT_EQ(cl.set.replicas[0]->stats().commit_lsn, F);
+    EXPECT_EQ(cl.set.replicas[1]->stats().commit_lsn, F);
+    EXPECT_EQ(cl.set.replicas[2]->stats().commit_lsn, -1) << "member 2 holds nothing; stalls at the baseline";
+    EXPECT_EQ(cl.client->all_committed_lsn(), -1) << "floor pinned by the behind member, not the frontier";
+    EXPECT_LT(cl.client->all_committed_lsn(), F);
+}
+
+// logout tears the session down on every replica (server-side), then a fresh login re-establishes it. The
+// session term is observable in the replica stats, so we can watch it clear and come back.
+TEST(CraftClient, LogoutClearsSessionThenReloginWorks) {
+    auto cl = make_cluster(3);
+    auto v = page_of(0x5A);
+    ASSERT_TRUE(wr(*cl.client, 7, v)) << "session active: write succeeds";
+    uint64_t const t0 = cl.client->term();
+    ASSERT_NE(t0, 0u);
+    for (uint32_t i = 0; i < 3; ++i)
+        EXPECT_EQ(cl.set.replicas[i]->stats().term, t0) << "session term held on every replica";
+
+    ASSERT_TRUE(rg(cl.client->logout()).has_value());
+
+    // Server side: the InternalLogout cleared the session term on every replica.
+    for (uint32_t i = 0; i < 3; ++i)
+        EXPECT_EQ(cl.set.replicas[i]->stats().term, 0u) << "logout tore the session down on every replica";
+    // Client side: it now considers itself disconnected, so IO fails fast (no term to fence with).
+    auto v2 = page_of(0x5B);
+    EXPECT_FALSE(rg(cl.client->write(blk(7), v2.size(), one_iov(v2))).has_value());
+
+    // Re-login re-establishes a live session and IO works again.
+    ASSERT_TRUE(rg(cl.client->login(TOKEN)).has_value());
+    EXPECT_NE(cl.client->term(), 0u) << "fresh session";
+    for (uint32_t i = 0; i < 3; ++i)
+        EXPECT_EQ(cl.set.replicas[i]->stats().term, cl.client->term());
+    auto v3 = page_of(0x5C);
+    EXPECT_TRUE(wr(*cl.client, 7, v3));
+    EXPECT_EQ(rd(*cl.client, 7), v3);
+}
+
+// The collapse in isolation: at most one outstanding keep_alive per leg. A busy read stream tops a leg up
+// again only after its previous keep_alive has completed (released the flag), never one-per-read.
+TEST(ReadRouteMap, OneOutstandingKeepAlivePerLeg) {
+    craft::read_route_map m;
+    m.reset(3, /*L=*/-1);
+    EXPECT_TRUE(m.try_begin_keepalive(1)) << "first keep_alive to a leg may fire";
+    EXPECT_FALSE(m.try_begin_keepalive(1)) << "one already outstanding on that leg -> collapsed";
+    EXPECT_TRUE(m.try_begin_keepalive(2)) << "a different leg is independent";
+    m.end_keepalive(1);
+    EXPECT_TRUE(m.try_begin_keepalive(1)) << "released -> may fire again";
+    EXPECT_FALSE(m.try_begin_keepalive(2)) << "leg 2 is still outstanding";
+}
+
+// Timer-less liveness drive: a read touches one leg and keeps the others alive; a write touches everyone and
+// keeps no one alive. The keep_alives are fire-and-forget, so they don't delay the read (asserted by the fact
+// that rd() returns before they land -- we poll for them).
+TEST(CraftClient, ReadDrivesKeepAliveToSkippedLegs) {
+    auto cl = make_cluster(3);
+    auto v = page_of(0x77);
+    ASSERT_TRUE(wr(*cl.client, 2, v));
+    for (uint32_t i = 0; i < 3; ++i)
+        EXPECT_EQ(cl.set.replicas[i]->keepalives_served(), 0u) << "a write broadcasts to all; it drives no keep_alive";
+
+    ASSERT_EQ(rd(*cl.client, 2), v);
+    auto total_ka = [&] {
+        std::size_t n = 0;
+        for (uint32_t i = 0; i < 3; ++i)
+            n += cl.set.replicas[i]->keepalives_served();
+        return n;
+    };
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (total_ka() < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    EXPECT_GE(total_ka(), 2u) << "the two legs the read skipped each got a (fire-and-forget) keep_alive";
 }
 
 int main(int argc, char* argv[]) {

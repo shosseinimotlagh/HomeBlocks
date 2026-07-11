@@ -245,4 +245,12 @@ ublkpp::disk_task< int > CraftUblkDisk::async_iov(ublksrv_queue const* q, ublk_i
     co_return co_await *state;
 }
 
+void CraftUblkDisk::probe_tick(ublksrv_queue const*) noexcept {
+    // Idle queue: no read/write to piggyback the commit watermark on and no reply to keep the session warm.
+    // Drive a keep_alive at every leg (bounded to one outstanding per leg) so the session does not expire --
+    // this is the client's timer-less liveness mechanism. drive_keepalives fires each keep_alive detached, so
+    // this returns immediately and never blocks the queue thread.
+    _client->drive_keepalives();
+}
+
 } // namespace homeblocks::ublk

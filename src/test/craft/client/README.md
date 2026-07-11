@@ -331,14 +331,40 @@ member that missed a block and then saw only **universal** rewrites of it (or no
 never stale) until recovery or re-login -- because universal writes are skipped by the fold to keep healthy
 writes lock-free, so they do not clear an earlier miss.
 
+## Liveness: the keep_alive drive and the reclaim floor
+
+`keep_alive` is CRAFT's commit carrier: it returns a member's achieved `{commit_lsn, last_append_lsn}` and
+resets its session watchdog. The client uses it two ways.
+
+**The reclaim floor.** `flush()` broadcasts `keep_alive` to every replica and feeds each reply's `commit_lsn`
+to the router via `advance_synced(i, C)`. `synced[i]` is the client's model of member `i`'s applied watermark,
+so `all_committed = min(synced)` -- stamped into `client_hdr.all_committed_lsn` -- is the set-wide journal
+reclaim floor. Being the MIN, a member with a hole (its `commit_lsn` stalls just below the hole) correctly
+pins the floor down, holding the journal a peer still needs to resync from; a member never heard from sits at
+the login baseline, pinning it there. This replaced a placeholder `-1` that reclaimed nothing.
+
+**Timer-less keep_alive, driven off IO + idle.** Rather than run a dedicated timer, the client drives
+`keep_alive` off the events it already has: a **read** touches one leg, so it fires a `keep_alive` at every
+OTHER leg (`drive_keepalives`); a **write** broadcasts to all legs, so it drives none; and the ublk adapter's
+**`probe_tick`** (called when the queue is idle) drives all legs. Every keep_alive is **fire-and-forget**
+(`detach`), so it never delays the read/write ack -- a keep_alive to a slow or unavailable peer times out in
+the background. The collapse is **one outstanding keep_alive per leg** (`ka_inflight_`): a busy read stream
+tops a leg up again only once its previous keep_alive completes, never one-per-read. A member routed around --
+the delayed leader in the failover smoke test -- shows `keepalives_served` climbing while `reads_served` stays
+flat (both in the REST endpoint).
+
+**`logout`.** Explicit, term-fenced session teardown: the leader commits an `InternalLogout` that clears the
+session on every replica, so any later IO from this (now stale) client is fenced with `STALE_TERM` without
+waiting for the next login's term bump. Best-effort; a fresh login re-establishes a session.
+
 ## What is NOT here yet
 
-**Recovery of a behind member.** A member with a stuck Missing entry (it missed a `<= folded` write) only
-re-earns eligibility for that block when the client learns it caught up -- which needs a `commit_lsn` signal
-(`keep_alive`/`get_lsns` return `LSNPair`). The seam is `advance_synced(i, C)`: under `map_mu_` exclusive it
-raises `synced[i]` and erases every `miss[i]` segment whose value `<= C`. Not called in the MVP; until then a
-member is over-avoided for the specific blocks it missed until re-login (memory stays bounded either way).
-This pairs with the broadcast-`keep_alive` work below.
+**Recovery of a behind member (wired, dormant).** `advance_synced` is fed by the broadcast `keep_alive` above,
+so a member's `synced[i]` tracks its `commit_lsn` and its Missing entries `<= C` are erased under `map_mu_`.
+But that erase is dormant until **server-side resync** fills the member's holes: a laggard's `commit_lsn`
+stalls just below its first hole, so nothing at or above it clears until resync fills it. Resync is
+peer-to-peer, not a client responsibility. Until it lands a member is over-avoided for the specific blocks it
+missed (bounded; cleared by supersede or re-login meanwhile).
 
 **Per-block eligibility above the frontier.** Rule (c) gates on the whole range at `Hmax`, so a member behind
 on any overlapping *live* (above-frontier) write is routed around even for a read whose winners it all holds.
@@ -347,13 +373,13 @@ per-block; this is the remaining coarse tier. Safe either way; it costs availabi
 
 Also outstanding, in rough order:
 
-- broadcast `keep_alive` to all replicas → the true set-wide `all_committed_lsn` (today we send `-1`,
-  deliberately: our own frontier is an upper bound on the minimum, never the minimum, and sending it
-  would let a replica reclaim journal a lagging peer still needs);
-- a `keep_alive` timer, so the server watchdog sees the client;
+- the server-side **watchdog** the keep_alive drive is meant to reset (a deferred seam today,
+  `mem_craft_replica.cpp`), and server-side **resync** (`SyncRSCommitLSN`) that makes the recovery erase above
+  effective -- both are server/peer concerns, not client work;
 - re-login on `STALE_TERM`, and `resolve_upto()` to retire a `failed` hole after a leader resolution
   round (there is no public verb for one today);
-- ublk `DISCARD` / `WRITE_ZEROES` → a CRAFT zero write (empty `sg_list`);
+- the client-side all-zero scan that picks the CRAFT zero-write form (the server does not re-scan a data
+  write), plus ublk `DISCARD` / `WRITE_ZEROES` → a CRAFT zero write (empty `sg_list`);
 - reply-side fault injection. The wire models the request leg only: `plan_delivery` conflates the round trip
   into one `delay`, and the reply is the coroutine's return value rather than a message. A peer that applies
   a write and then loses or delays its *reply* needs `request_latency` and `reply_latency` as separate legs.
@@ -481,7 +507,7 @@ deployment does not do in-process:
 | `CraftUblkDisk` | **0** | — |
 | `dlsn_tracker`'s `StreamTracker` | 2, both *shared* | `create` at reserve + `update` at resolve; exclusive only on `truncate` (1-in-512) and resize |
 | `read_route_map`'s `StreamTracker` | 4, all *shared* | `create` at reserve + one `update` per replica completion. The **same** `sisl::StreamTracker` the tracker uses. Completions are shared-lock updates (stragglers off the ack path); reads take the shared lock to `foreach`; exclusive only on batched `truncate`/resize |
-| `read_route_map`'s `map_mu_` | 1 *shared* per read; **0** per healthy write | guards the per-member Missing maps. A read takes it *shared* for the `intersects` query (empty map = trivial); a healthy write records no miss, so it never touches it. Taken *exclusive* only by a fold that must apply a miss -- fault-cold. (`pending_mu_`/`fold_mu_` are two more std::mutexes touched only off the healthy path.) |
+| `read_route_map`'s `map_mu_` | 1 *shared* per read; **0** per healthy write | guards the per-member Missing maps. A read takes it *shared* for the `intersects` query (empty map = trivial); a healthy write records no miss, so it never touches it. Taken *exclusive* by a fold that must apply a miss (fault-cold) and by `advance_synced` on each keep_alive reply -- both **off the read/write ack path** (a keep_alive completes on a detached background task). (`pending_mu_`/`fold_mu_` are two more std::mutexes touched only off the ack path; `ka_inflight_` is a lock-free atomic per leg.) |
 | `MemTransport::mu_` | **0** | guards `by_id_`/`leader_`/`term_` only. Faults are read off a copy-on-write snapshot (`faults()`), so the IO path is two acquire loads |
 | `replica_service::mu` | 6 (post + pop, per replica) | the model's stand-in for a NIC. A real transport submits an SQE here |
 | `MemCraftReplica::mu_` | 3 (one journal insert each) | the *server*, on the far side of the wire. Not the client's cost |

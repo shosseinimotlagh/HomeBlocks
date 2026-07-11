@@ -91,6 +91,8 @@ public:
 
     // Test observability: reads this replica has served (see reads_served_).
     std::size_t reads_served() const { return reads_served_.load(std::memory_order_relaxed); }
+    // Test observability: keep_alives this replica has answered (the client's timer-less liveness drive).
+    std::size_t keepalives_served() const { return keepalives_served_.load(std::memory_order_relaxed); }
 
     // ── craft_replica: client-facing ──
     async_result< LoginResult > login(uint64_t client_token) override;
@@ -154,6 +156,7 @@ private:
     // Test observability: how many reads this replica actually served. Lets a test witness read routing
     // (e.g. round-robin distribution across members). Not part of the CRAFT surface.
     std::atomic< std::size_t > reads_served_{0};
+    std::atomic< std::size_t > keepalives_served_{0};
 
     replica_endpoint ep_;
     uint32_t page_size_;

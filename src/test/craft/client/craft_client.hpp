@@ -52,8 +52,20 @@ public:
     // parallel sub-reads when blocks in the range need different horizons.
     async_result< size_t > read(uint64_t addr, uint64_t len, sisl::sg_list dest);
 
-    // The dedicated commit carrier: advance the leader's frontier + reset its watchdog (keep_alive).
+    // The dedicated commit carrier: broadcast keep_alive to every replica, advancing the set-wide commit
+    // frontier and refreshing the client's per-member commit_lsn model (the reclaim floor + recovery seam).
     async_status flush();
+
+    // Explicit session teardown (term-fenced): the leader clears the session on all replicas, fencing any
+    // later IO from this client with STALE_TERM. Best-effort; a fresh login re-establishes a session.
+    async_status logout();
+
+    // Fire a keep_alive at every leg except `exclude_idx` that does not already have one outstanding (the
+    // one-per-leg collapse). This is the client's timer-less liveness drive: read() calls it (excluding the
+    // leg it served), and the ublk adapter's probe_tick calls it when the queue is idle. Fire-and-forget;
+    // a no-op before login. A write needs no drive -- it already broadcasts to every leg.
+    static constexpr std::size_t k_no_leg = ~std::size_t{0};
+    void drive_keepalives(std::size_t exclude_idx = k_no_leg);
 
     uint32_t lba_size() const { return lba_size_; }
     uint64_t term() const { return term_; }
@@ -65,6 +77,8 @@ public:
     // up to it (a behind member is routed around for <= folded reads).
     int64_t route_folded() const { return route_->folded(); }
     bool route_caught_up(std::size_t idx) const { return route_->caught_up(idx); }
+    // The set-wide journal reclaim floor the broadcast keep_alive maintains: min commit_lsn across members.
+    int64_t all_committed_lsn() const { return route_->all_committed(); }
 
     // Observability: the client's dLSN watermarks + the unresolved slots pinning the frontier. Safe to call
     // from any thread while IO is in flight. (Named dlsn_stats, not tracker_stats, so the member does not
@@ -74,11 +88,6 @@ public:
     uint32_t leader_index() const { return leader_; }
 
 private:
-    // The set-wide min commit_lsn floors journal reclaim on every replica. Our own frontier is an UPPER
-    // bound on it, never the min, so sending that would let a replica reclaim journal a lagging peer still
-    // needs. -1 (unknown) until a broadcast keep_alive can compute the real minimum.
-    static constexpr int64_t k_all_committed_unknown = -1;
-
     client_hdr make_hdr() const;
     std::size_t quorum() const { return replicas_.size() / 2 + 1; }
     // The two guards every IO opens with; nullopt means the IO may proceed.

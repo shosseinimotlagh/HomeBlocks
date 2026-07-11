@@ -56,9 +56,15 @@
 // lock-free frontier advance + shared map query (empty map) + shared overlay scan.
 //
 // BOUNDING. The map is bounded by each member's coalesced missing byte coverage (icl merges adjacent
-// ranges), cleared by supersede (a later folded write it holds) and by the deferred commit_lsn recovery
-// (advance_synced), reset on re-login. A member that missed a never-rewritten block stays over-avoided
-// (safe, never stale) until recovery/re-login.
+// ranges), cleared by supersede (a later folded write it holds) and by commit_lsn recovery (advance_synced,
+// fed by the broadcast keep_alive), reset on re-login. Until server-side resync fills a member's holes its
+// commit_lsn stalls just below the first one, so recovery clears only what resync has filled; a member that
+// missed a block only rewritten universally (or never) stays over-avoided (safe, never stale) until then.
+//
+// RECLAIM FLOOR. `synced_` doubles as the client's model of each member's commit_lsn, so `all_committed_` --
+// the min across members, stamped into `client_hdr.all_committed_lsn` -- is the set-wide journal reclaim
+// floor. A member we have not heard a commit_lsn from (down, or pre-keep_alive) holds it at the login
+// baseline, correctly pinning the floor down until that member reports progress.
 
 #include <algorithm>
 #include <array>
@@ -121,8 +127,11 @@ public:
             for (std::size_t i = 0; i < n; ++i)
                 miss_[i].clear();
         }
-        for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t i = 0; i < n; ++i) {
             synced_[i].store(login_dlsn, std::memory_order_relaxed);
+            ka_inflight_[i].store(false, std::memory_order_relaxed);
+        }
+        all_committed_.store(login_dlsn, std::memory_order_relaxed); // min synced_ == login baseline
         {
             std::lock_guard< std::mutex > g{pending_mu_};
             pending_.clear();
@@ -255,14 +264,20 @@ public:
         return ok;
     }
 
-    // DEFERRED recovery hook (NOT called in the MVP): the future broadcast keep_alive / get_lsns sweep calls
-    // this with member `idx`'s achieved commit_lsn `C`. Everything <= C is now durably applied on the member,
-    // so its Missing entries at those dLSNs are cleared -- un-sticking a member that resynced a block it
-    // never re-acked. This is the sole place synced_ advances and the sole non-fold map mutation.
+    // Recovery hook, fed by the broadcast keep_alive with member `idx`'s achieved commit_lsn `C`. Two effects:
+    // (1) advance `synced_[idx]` and recompute `all_committed_` (the min-across-members reclaim floor) -- this
+    // is live; (2) erase `miss_[idx]` segments <= C, i.e. blocks the member has since applied. Effect (2) is
+    // dormant until server-side resync fills the member's holes: a laggard's commit_lsn stalls just below its
+    // first Missing hole, so nothing at/above that hole clears until resync fills it (then C passes it and the
+    // erase fires). This is the sole place synced_ advances and the sole non-fold map mutation.
     void advance_synced(std::size_t idx, int64_t C) {
         std::lock_guard< std::mutex > fg{fold_mu_};
         if (C <= synced_[idx].load(std::memory_order_relaxed)) return;
         synced_[idx].store(C, std::memory_order_release);
+        int64_t floor = synced_[0].load(std::memory_order_relaxed); // min commit_lsn across members
+        for (std::size_t i = 1; i < n_; ++i)
+            floor = std::min(floor, synced_[i].load(std::memory_order_relaxed));
+        all_committed_.store(floor, std::memory_order_release);
         std::unique_lock< std::shared_mutex > mg{map_mu_};
         std::vector< boost::icl::interval< uint64_t >::type > drop;
         for (auto const& seg : miss_[idx])
@@ -271,8 +286,17 @@ public:
             miss_[idx].erase(iv);
     }
 
+    // At-most-one outstanding keep_alive per member (leg) -- the collapse for the client's timer-less keep_alive
+    // drive. try_begin_keepalive returns true iff the caller may fire one (none already in flight for `idx`);
+    // the completion MUST call end_keepalive to release. This lives in the route map, not the client, because a
+    // detached keep_alive outlives the client (it captures this map's shared_ptr) and clears the flag here.
+    bool try_begin_keepalive(std::size_t idx) { return !ka_inflight_[idx].exchange(true, std::memory_order_acq_rel); }
+    void end_keepalive(std::size_t idx) { ka_inflight_[idx].store(false, std::memory_order_release); }
+
     // Observability / tests.
     int64_t folded() const { return folded_.load(std::memory_order_acquire); }
+    // The set-wide journal reclaim floor: min commit_lsn across members (client_hdr.all_committed_lsn).
+    int64_t all_committed() const { return all_committed_.load(std::memory_order_acquire); }
     bool caught_up(std::size_t idx) const {
         if (synced_[idx].load(std::memory_order_acquire) < login_dlsn_) return false;
         std::shared_lock< std::shared_mutex > mg{map_mu_};
@@ -314,6 +338,8 @@ private:
     std::array< missing_map, k_max_members > miss_; // below the frontier: per-member Missing byte ranges
     std::array< std::atomic< int64_t >, k_max_members >
         synced_{}; // per member: client's model of its commit_lsn (>= L)
+    std::array< std::atomic< bool >, k_max_members >
+        ka_inflight_{}; // per member: a keep_alive is outstanding (the one-per-leg collapse)
 
     std::mutex pending_mu_;                       // guards pending_
     std::vector< pending_miss > pending_;         // durable non-universal completed slots awaiting fold
@@ -322,9 +348,10 @@ private:
 
     std::size_t n_{0};
     std::size_t quorum_{1};
-    int64_t login_dlsn_{-1};                // L: the Synced baseline for this session
-    std::atomic< int64_t > folded_{-1};     // every dLSN <= this is collapsed into the interval maps
-    std::atomic< int64_t > last_trunc_{-1}; // gates batched truncation
+    int64_t login_dlsn_{-1};                   // L: the Synced baseline for this session
+    std::atomic< int64_t > all_committed_{-1}; // min synced_ across members; the journal reclaim floor
+    std::atomic< int64_t > folded_{-1};        // every dLSN <= this is collapsed into the interval maps
+    std::atomic< int64_t > last_trunc_{-1};    // gates batched truncation
     uint64_t all_mask_{0};
 };
 

@@ -21,14 +21,18 @@
 #include <sisl/async/when_all.hpp>
 #include <sisl/fds/buffer.hpp> // sisl::sg_iterator
 
+#include "coro_helpers.hpp" // homeblocks::detail::detach (src/lib, on the include path)
+
 namespace homeblocks::craft {
 
 craft_client::craft_client(std::vector< volume_handle > replicas, uint32_t leader, uint32_t max_inflight) :
         replicas_(std::move(replicas)), leader_(leader), tracker_(max_inflight) {}
 
 client_hdr craft_client::make_hdr() const {
-    // Every IO piggybacks the commit frontier: CRAFT has no standalone commit verb.
-    return client_hdr{term_, tracker_.frontier(), k_all_committed_unknown};
+    // Every IO piggybacks the commit frontier (CRAFT has no standalone commit verb) and the set-wide reclaim
+    // floor -- min commit_lsn across members, which the broadcast keep_alive maintains (the login baseline
+    // until the first sweep). A replica reclaims journal below min(all_committed_lsn, its own apply frontier).
+    return client_hdr{term_, tracker_.frontier(), route_->all_committed()};
 }
 
 // Fail fast rather than burn a dLSN on an IO the replicas will reject anyway. They enforce alignment too.
@@ -60,7 +64,11 @@ async_status craft_client::login(uint64_t client_token) {
         lba_size_ = lr->lba_size;
         tracker_.reset_at(lr->dLSN, lr->lba_size);
         // Seed the router for this session: everything <= the login dLSN is universally held (the login
-        // SyncRSCommitLSN barrier), and any evidence from a prior session is cleared.
+        // SyncRSCommitLSN barrier). Install a FRESH map rather than resetting in place: a detached straggler
+        // from a prior session still holds a shared_ptr to the old map (the when_quorum hook captured a copy)
+        // and may run record_completion after we return here -- reconstructing the live map under it would
+        // race. The old map is orphaned and freed once its last straggler finishes.
+        route_ = std::make_shared< read_route_map >();
         route_->reset(replicas_.size(), lr->dLSN);
         co_return ok();
     }
@@ -209,7 +217,12 @@ async_result< size_t > craft_client::read(uint64_t addr, uint64_t len, sisl::sg_
         any_eligible = true;
 
         auto r = co_await issue_plan(replicas_[idx], hdr, *plan, addr, len, dest);
-        if (r.has_value()) co_return *r;
+        if (r.has_value()) {
+            // Timer-less keep_alive drive: top up every leg this read did NOT touch (one outstanding per leg),
+            // so their sessions do not expire and their commit/append refresh. The leg we served is fresh.
+            drive_keepalives(idx);
+            co_return *r;
+        }
 
         last_err = r.error();
         bool const transport_failure = (last_err == make_error_condition(craft_error::REPLICA_DOWN)) ||
@@ -224,10 +237,83 @@ async_result< size_t > craft_client::read(uint64_t addr, uint64_t len, sisl::sg_
                                            : make_error_condition(craft_error::NOT_ELIGIBLE));
 }
 
-async_status craft_client::flush() {
-    auto r = co_await homeblocks::keep_alive(replicas_[leader_], make_hdr());
-    if (!r.has_value()) co_return std::unexpected(r.error());
+// A detached keep_alive to one leg: fetch its commit/append and reset its session watchdog, feed the reply to
+// the router (advances synced_ -> the reclaim floor + recovery), then release the leg's one-outstanding flag.
+// Fire-and-forget, so it captures the map by shared_ptr (it may outlive the client) and the handle by value.
+static async_status fire_keepalive(volume_handle h, client_hdr hdr, std::shared_ptr< read_route_map > route,
+                                   std::size_t idx) {
+    auto r = co_await homeblocks::keep_alive(h, hdr);
+    if (r.has_value()) route->advance_synced(idx, r->commit_lsn);
+    route->end_keepalive(idx);
     co_return ok();
+}
+
+void craft_client::drive_keepalives(std::size_t exclude_idx) {
+    if (term_ == 0) return; // no session yet: nothing to keep alive
+    client_hdr const hdr = make_hdr();
+    for (std::size_t m = 0; m < replicas_.size(); ++m) {
+        if (m == exclude_idx) continue;
+        // One outstanding keep_alive per leg is the whole collapse: a busy read stream tops a leg up again only
+        // once its previous keep_alive has completed, never one-per-read.
+        if (route_->try_begin_keepalive(m)) homeblocks::detail::detach(fire_keepalive(replicas_[m], hdr, route_, m));
+    }
+}
+
+async_status craft_client::flush() {
+    // keep_alive is CRAFT's commit carrier AND how the client learns each member's achieved commit_lsn.
+    // Broadcast it to EVERY replica (not just the leader): feed each reply to the router, which advances that
+    // member's synced_ -> the set-wide all_committed reclaim floor (min across members) and clears Missing
+    // entries the member has applied. A down/errored member is skipped: its synced_ stays put, correctly
+    // pinning the floor down until it reports progress. Succeeds if any replica answered.
+    std::size_t const n = replicas_.size();
+    client_hdr const hdr = make_hdr();
+    std::vector< async_result< LSNPair > > futs;
+    futs.reserve(n);
+    for (auto& h : replicas_)
+        futs.push_back(homeblocks::keep_alive(h, hdr));
+
+    auto const results = co_await sisl::async::when_all(std::move(futs));
+    bool any = false;
+    std::error_condition last_err{};
+    for (std::size_t i = 0; i < n; ++i) {
+        if (results[i].has_value()) {
+            any = true;
+            route_->advance_synced(i, results[i]->commit_lsn);
+        } else {
+            last_err = results[i].error();
+        }
+    }
+    if (!any) co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NO_QUORUM));
+    co_return ok();
+}
+
+async_status craft_client::logout() {
+    // Explicit session teardown: the leader commits an InternalLogout that clears client_token/term on all
+    // replicas, so any later IO from this (now stale) client is fenced with STALE_TERM -- without waiting for
+    // the next login's term bump to do it. Term-fenced and best-effort; follow NOT_LEADER redirects like
+    // login. On success -- or on STALE_TERM, meaning we are already deposed -- clear local session state so a
+    // subsequent IO trips the not-connected precheck until the next login.
+    if (term_ == 0) co_return ok(); // no active session to tear down
+    std::size_t const n = replicas_.size();
+    std::error_condition last_err{};
+    for (std::size_t hop = 0; hop < n; ++hop) {
+        auto const target = static_cast< uint32_t >((leader_ + hop) % n);
+        auto r = co_await homeblocks::logout(replicas_[target], make_hdr());
+        if (r.has_value()) {
+            leader_ = target;
+            term_ = 0;
+            lba_size_ = 0;
+            co_return ok();
+        }
+        last_err = r.error();
+        if (r.error() == make_error_condition(craft_error::STALE_TERM)) {
+            term_ = 0; // already fenced elsewhere; the session is gone
+            lba_size_ = 0;
+            co_return ok();
+        }
+        // NOT_LEADER (redirect) or REPLICA_DOWN: try the next replica.
+    }
+    co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NOT_LEADER));
 }
 
 } // namespace homeblocks::craft

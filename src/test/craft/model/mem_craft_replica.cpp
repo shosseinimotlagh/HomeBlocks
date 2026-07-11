@@ -120,6 +120,7 @@ result< LSNPair > MemCraftReplica::do_keep_alive(client_hdr hdr) {
     std::lock_guard< std::mutex > g{mu_};
     // Term-fenced: a stale client must NOT reset the liveness watchdog (that would block failover).
     if (hdr.term != state_.term) return fail(craft_error::STALE_TERM);
+    keepalives_served_.fetch_add(1, std::memory_order_relaxed); // test observability: the client's liveness drive
     apply_up_to(hdr.commit_lsn);
     // watchdog reset + journal reclaim below min(hdr.all_committed_lsn, commit_lsn) are deferred seams.
     return LSNPair{state_.commit_lsn, state_.last_append_lsn};

@@ -112,6 +112,12 @@ json replica_json(std::size_t index, MemCraftReplica const& r, MemTransport cons
     j["commit_lag"] = cs.frontier - s.commit_lsn;
     j["append_lag"] = cs.issued - s.last_append_lsn;
 
+    // Client-contact witnesses: reads routed here, and keep_alives the client drove here (the timer-less
+    // liveness drive). A member routed around -- e.g. the delayed leader in the failover smoke test -- shows
+    // reads_served flat but keepalives_served climbing, since every read that skips it drives it a keep_alive.
+    j["reads_served"] = r.reads_served();
+    j["keepalives_served"] = r.keepalives_served();
+
     j["missing_count"] = s.missing_count;
     j["missing_sample"] = s.missing_sample;
 

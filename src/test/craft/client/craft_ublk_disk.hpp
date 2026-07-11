@@ -107,6 +107,11 @@ public:
     ublkpp::disk_task< int > async_iov(ublksrv_queue const* q, ublk_io_data const* data, iovec* iovecs,
                                        uint32_t nr_vecs, uint64_t addr) override;
 
+    // ublkpp calls this on the queue thread when the queue is idle. With no IO to piggyback the commit
+    // watermark on, we drive a keep_alive at every leg (one outstanding each) so the session does not expire --
+    // the client's stand-in for a keep_alive timer. Fire-and-forget, so it never blocks the queue.
+    void probe_tick(ublksrv_queue const* q) noexcept override;
+
 private:
     std::shared_ptr< craft::craft_client > _client;
     volume_id_t _vol_id;
