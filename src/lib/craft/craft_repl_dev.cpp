@@ -40,15 +40,20 @@ async_result< craft::LoginResult > CraftReplDev::login(uint64_t /* client_token 
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_status CraftReplDev::write(uint64_t /* term */, int64_t /* lsn */, lba_t /* lba */, lba_count_t /* len */,
-                                 sisl::sg_list /* data */) {
+async_result< craft::lsn_pair > CraftReplDev::write(uint64_t /* term */, int64_t /* lsn */, lba_t /* lba */,
+                                                    lba_count_t /* len */, sisl::sg_list /* data */) {
     LOGW("CraftReplDev::write not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_result< sisl::sg_list > CraftReplDev::read(uint64_t /* term */, int64_t /* read_lsn */, lba_t /* lba */,
-                                                 lba_count_t /* len */) {
+async_result< craft::read_result > CraftReplDev::read(uint64_t /* term */, int64_t /* read_lsn */, lba_t /* lba */,
+                                                      lba_count_t /* len */, sisl::sg_list /* dest */) {
     LOGW("CraftReplDev::read not yet implemented");
+    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+}
+
+async_result< craft::resolution_result > CraftReplDev::request_resolution(uint64_t /* term */, int64_t /* upto */) {
+    LOGW("CraftReplDev::request_resolution not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 

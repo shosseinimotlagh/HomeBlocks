@@ -49,6 +49,14 @@ struct client_hdr {
 
 // One sub-range of a read's sparse layout, in BYTES. Carries no bytes (they live in the dest buffer).
 struct io_extent { uint64_t addr; uint64_t len; bool hole; }; // hole => reads as zeros (unmapped)
+
+// A read reply: the sparse layout PLUS the replica's piggybacked watermarks. Every CRAFT IO response
+// carries {commit_lsn, last_append_lsn}, so any round-trip refreshes the client's model of that member.
+struct read_result { std::vector<io_extent> extents; lsn_pair lsns; };
+
+// A resolution-round reply: everything <= resolved_upto is resolved; empty_slots are the Empty verdicts,
+// every other formerly-unresolved slot was filled from a holder (the failed write completed late).
+struct resolution_result { int64_t resolved_upto; std::vector<int64_t> empty_slots; };
 ```
 
 ---
@@ -97,8 +105,8 @@ IO whose `term` != the new session term.
 ### `async_write`
 
 ```cpp
-async_status async_write(volume_handle const& vol, client_hdr hdr, int64_t dlsn,
-                         uint64_t addr, uint64_t len, sisl::sg_list data);
+async_result<lsn_pair> async_write(volume_handle const& vol, client_hdr hdr, int64_t dlsn,
+                                   uint64_t addr, uint64_t len, sisl::sg_list data);
 ```
 
 Append the client-assigned write at slot `dlsn`. `addr`/`len` are byte offset/length, block-aligned.
@@ -108,26 +116,31 @@ buffer). Both take a `dLSN` and merge by highest-`dLSN`-per-LBA. Does **not** ap
 `hdr.commit_lsn` rides along and advances the contiguous commit frontier best-effort, in `dLSN` order
 (this is CRAFT's commit — piggybacked on the writes the client is already broadcasting). Rejected with
 `craft_error::STALE_TERM` if `hdr.term` != the session term, or `std::errc::invalid_argument` on
-misalignment. ACK fires on journal-append completion.
+misalignment. ACK fires on journal-append completion and **returns the achieved
+`{commit_lsn, last_append_lsn}`** — every CRAFT IO response piggybacks the watermarks, so any
+round-trip refreshes the client's per-member model (its reclaim floor and Missing-map recovery) without
+a separate `keep_alive`.
 
 ---
 
 ### `async_read`
 
 ```cpp
-async_result<std::vector<io_extent>>
+async_result<read_result>
 async_read(volume_handle const& vol, client_hdr hdr, int64_t read_lsn,
            uint64_t addr, uint64_t len, sisl::sg_list dest);
 ```
 
 `read_lsn` is the read horizon `H`. Returns the latest version ≤ `H` for `[addr, addr+len)` by **filling
 the caller-owned `dest` buffer in place** — data sub-ranges get their bytes, holes get zeros — and
-returns the sparse **layout** (`io_extent[]`, ascending by `addr`) marking which byte sub-ranges were
-data vs holes. Data comes from the LBA index if applied, or straight from the **journal-tail overlay**
-if only Appended (an overlay read; no index write on the read path). **Entries above `H` are never
-served even if the replica holds them** (the sub-quorum tail). The read never fetches from a peer; the
-client routes only to a replica that holds every write ≤ `H` overlapping the range. `hdr.commit_lsn`
-piggybacks a frontier advance. Rejects on term mismatch / misalignment.
+returns `read_result`: the sparse **layout** (`io_extent[]`, ascending by `addr`) marking which byte
+sub-ranges were data vs holes, plus the replica's piggybacked **`{commit_lsn, last_append_lsn}`**
+(snapshotted atomically with the read; see `async_write`). Data comes from the LBA index if applied, or
+straight from the **journal-tail overlay** if only Appended (an overlay read; no index write on the
+read path). **Entries above `H` are never served even if the replica holds them** (the sub-quorum
+tail). The read never fetches from a peer; the client routes only to a replica that holds every write ≤
+`H` overlapping the range. `hdr.commit_lsn` piggybacks a frontier advance. Rejects on term mismatch /
+misalignment.
 
 ---
 
@@ -162,6 +175,27 @@ quorum-acked writes.
 > **There is no standalone `commit` verb.** The commit watermark advances via `hdr.commit_lsn`
 > piggybacked on `async_write` / `async_read` / `keep_alive`; `keep_alive` is its dedicated carrier and
 > also resets the watchdog. Readability is per-write and does not wait for the watermark (overlay reads).
+
+---
+
+### `request_resolution`
+
+```cpp
+async_result<resolution_result> request_resolution(volume_handle const& vol, client_hdr hdr, int64_t upto);
+```
+
+The **client-requested resolution round** (the design's client-request `SyncRSCommitLSN` trigger), fired
+by the client after a **failed (sub-quorum) write** instead of waiting for the watchdog / periodic
+cadence. The round is **leader** work — it reuses the same pre-resolution machinery the
+`SyncRSCommitLSN` proposer runs (fetch each unresolved slot ≤ `upto` from a holder, or verdict it Empty
+on quorum-lacks evidence, then propose the entry carrying the verdicts) — but the client cannot know who
+leads mid-session, so it **broadcasts** this to every member with at most one outstanding per member: the
+current leader resolves; a follower returns `craft_error::NOT_LEADER` (or, once peer channels exist, may
+forward to its leader). On success everything ≤ `resolved_upto` is resolved set-wide: `empty_slots` were
+verdicted Empty (permanent no-op holes; a **late write into an Empty-verdicted slot is rejected** —
+reconciliation, Empty beats data — so a voided write fails deterministically on its own ack path), and
+every other formerly-unresolved slot was filled and is durable (the failed write completed late).
+Term-fenced (`STALE_TERM`).
 
 ---
 
@@ -212,10 +246,10 @@ The CRAFT free functions supersede the legacy byte block ops (now `[[deprecated]
 
 | Old API (deprecated) | CRAFT replacement |
 |---|---|
-| `async_write(vol, addr, sgs)` | `async_write(vol, hdr, dlsn, addr, len, data)` |
-| `async_read(vol, addr, sgs)` | `async_read(vol, hdr, read_lsn, addr, len, dest)` → `io_extent[]` layout |
+| `async_write(vol, addr, sgs)` | `async_write(vol, hdr, dlsn, addr, len, data)` → achieved `lsn_pair` |
+| `async_read(vol, addr, sgs)` | `async_read(vol, hdr, read_lsn, addr, len, dest)` → `read_result` (layout + `lsn_pair`) |
 | `async_unmap(vol, addr, len)` | `async_write(vol, hdr, dlsn, addr, len, /*empty*/ {})` (empty buffer = zero write) |
-| — | `login`, `keep_alive` (commit carrier), `get_lsns` |
+| — | `login`, `keep_alive` (commit carrier), `request_resolution` (failed-write trigger), `get_lsns` |
 
 The commit watermark rides on these calls (`client_hdr::commit_lsn`); there is no separate `commit`
 call. Each handle is **one replica device**, never an aggregate / "whole volume" handle. A handle comes

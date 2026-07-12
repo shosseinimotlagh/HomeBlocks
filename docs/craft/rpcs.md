@@ -1,11 +1,16 @@
 # CRAFT RPCs
 
-8 RPCs total. 4 client↔server (Login, Write, Read, KeepAlive), 4 server↔server (2 via RAFT, 2 non-RAFT).
-RAFT internal RPCs (heartbeat, vote, membership) are not listed here.
+9 RPCs total. 5 client↔server (Login, Write, Read, KeepAlive, Resolve), 4 server↔server (2 via RAFT,
+2 non-RAFT). RAFT internal RPCs (heartbeat, vote, membership) are not listed here.
 
 > **Commit is not a separate RPC.** The commit watermark rides on `client_hdr.commit_lsn`, piggybacked
 > on Write / Read / KeepAlive; KeepAlive is its dedicated carrier (commit + watchdog reset). Readability
 > is per-write and does not wait for it (journal-tail overlay reads).
+
+> **Every IO response piggybacks the replica's watermarks.** Write / Read / KeepAlive responses all carry
+> the achieved `{commit_lsn, last_append_lsn}`, so any round-trip refreshes that member's entry in the
+> client's model (its reclaim floor and Missing-map recovery) — the response-side mirror of the
+> `client_hdr` watermarks every IO request carries.
 
 > **Canonical design:** the [**CRAFT Design**](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design)
 > wiki page is the source of truth for the protocol, and
@@ -38,15 +43,17 @@ client_hdr: { term: uint64, commit_lsn: int64, all_committed_lsn: int64 }
 ### 1. Login (Unicast to leader)
 
 ```
-Request:  { client_token: uint64 }
+Request:  { volume_id: uuid, client_token: uint64 }
 Response: { members: [endpoint], dLSN: int64, term: uint64, lba_size: uint32 }
 ```
 
 Client sends to the RAFT leader (a follower replies `NOT_LEADER` + leader endpoint). Leader runs the
 full login orchestration (GetRSCommitLSN → optional FetchData → SyncRSCommitLSN RAFT → InternalLogin
-RAFT) and responds once both RAFT entries commit. `dLSN` is the starting per-partition LSN. `lba_size`
-is the volume block size in bytes — the client aligns every addr/len to it and presents the geometry to
-the filesystem.
+RAFT) and responds once both RAFT entries commit. `volume_id` names the volume to establish the session
+on (the design's `login(client_token, vol_id)`): a multi-volume server routes by it, and it is the same
+id every follow-on connection presents in HELO (see the wire doc in `craft_client`). `dLSN` is the
+starting per-partition LSN. `lba_size` is the volume block size in bytes — the client aligns every
+addr/len to it and presents the geometry to the filesystem.
 
 HomeBlocks handler: `CraftReplDev::login()`
 
@@ -56,12 +63,13 @@ HomeBlocks handler: `CraftReplDev::login()`
 
 ```
 Request:  { hdr: client_hdr, dlsn: int64, addr: uint64, len: uint64, data: bytes }
-Response: { status: Status }
+Response: { status: Status, commit_lsn: int64, last_append_lsn: int64 }
 ```
 
 Client sends to every replica in the set in parallel at the client-assigned `dlsn`. Each replica
-appends the entry to its data journal at slot `dlsn` and ACKs immediately. Durable once quorum ACKs,
-readable once Appended (served from the journal-tail overlay until applied).
+appends the entry to its data journal at slot `dlsn` and ACKs immediately, returning its achieved
+`{commit_lsn, last_append_lsn}` (the piggybacked watermarks; see the note at the top). Durable once
+quorum ACKs, readable once Appended (served from the journal-tail overlay until applied).
 
 **Empty `data` (length 0) is a zero write** (WRITE_ZEROES / discard-to-zero): the slot is metadata-only,
 allocates no blocks, and on apply unmaps its range (`len` is the range). Non-empty `data` is a data
@@ -76,7 +84,8 @@ HomeBlocks handler: `CraftReplDev::write()`
 
 ```
 Request:  { hdr: client_hdr, read_lsn: int64, addr: uint64, len: uint64 }
-Response: { status: Status, layout: [{ addr: uint64, len: uint64, hole: bool }], data: bytes }
+Response: { status: Status, commit_lsn: int64, last_append_lsn: int64,
+            layout: [{ addr: uint64, len: uint64, hole: bool }], data: bytes }
 ```
 
 `read_lsn` is the read horizon `H`. The client picks an *eligible* replica (one filled to the login
@@ -114,9 +123,33 @@ HomeBlocks handler: `CraftReplDev::keep_alive()`
 
 ---
 
+### 5. Resolve (Broadcast to all replicas; the leader resolves)
+
+```
+Request:  { hdr: client_hdr, upto: int64 }
+Response: { status: Status, resolved_upto: int64, empty_slots: [int64] }
+```
+
+The **client-requested resolution round** (the design's client-request `SyncRSCommitLSN` trigger),
+fired after a **failed (sub-quorum) write** instead of waiting for the watchdog / periodic cadence.
+The client cannot know who leads mid-session, so it broadcasts the request to every member (at most one
+outstanding per member, like its keep_alive drive): the **current leader** resolves every unresolved
+slot ≤ `upto` — fetch from any holder, or verdict `Empty` on quorum-lacks evidence, the same
+pre-resolution it runs before any `SyncRSCommitLSN` proposal — and proposes the entry carrying the
+verdicts; a follower replies `NOT_LEADER` (or forwards to its leader) and MUST NOT resolve anything
+itself. The response lists every `Empty` verdict ≤ `resolved_upto` (including earlier rounds', so a
+client whose previous reply was lost still learns them); every other formerly-unresolved slot was
+filled and is durable — the failed write completed late. A slot verdicted `Empty` is a permanent no-op
+hole: a replica **rejects** a late write into it (reconciliation: Empty beats data), so a write the
+round voided fails deterministically on its own ack path. Term-fenced.
+
+HomeBlocks handler: `CraftReplDev::request_resolution()`
+
+---
+
 ## Server → Server (non-RAFT)
 
-### 5. GetRSCommitLSN (Broadcast, initiated by leader)
+### 6. GetRSCommitLSN (Broadcast, initiated by leader)
 
 ```
 Request:  { term: uint64, my_commit_lsn: int64, my_last_append_lsn: int64, is_login: bool }
@@ -134,7 +167,7 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ---
 
-### 6. FetchData (Unicast, from behind replica to an ahead peer)
+### 7. FetchData (Unicast, from behind replica to an ahead peer)
 
 ```
 Request:  { lsns: [int64] }
@@ -154,14 +187,15 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ## Server → Server (RAFT)
 
-### 7. SyncRSCommitLSN (RAFT proposal, from leader)
+### 8. SyncRSCommitLSN (RAFT proposal, from leader)
 
 ```
 RAFT entry payload: { rs_commit_lsn: int64, client_token: uint64, empty_slots: [int64] }
 ```
 
-Proposed by the leader via `CraftReplDev::append()`. **Before proposing**, the leader resolves every
-unresolved slot ≤ `rs_commit_lsn`: fetch from any holder, or record an `Empty` verdict on
+Proposed by the leader via `CraftReplDev::append()` — triggered by login, the watchdog, the periodic
+checkpoint, or the client-requested **Resolve** RPC (#5). **Before proposing**, the leader resolves
+every unresolved slot ≤ `rs_commit_lsn`: fetch from any holder, or record an `Empty` verdict on
 quorum-lacks evidence; it never proposes past an unresolved slot. On RAFT commit each replica: verify
 the token, mark `empty_slots` as permanent no-op holes (discarding any local data there), fetch the
 remaining missing slots from peers, then advance `commit_lsn`. Replicas never declare `Empty`
@@ -170,7 +204,7 @@ and verdicts.
 
 ---
 
-### 8. InternalLogin (RAFT proposal, from leader during login)
+### 9. InternalLogin (RAFT proposal, from leader during login)
 
 ```
 RAFT entry payload: { client_token: uint64, term: uint64 }

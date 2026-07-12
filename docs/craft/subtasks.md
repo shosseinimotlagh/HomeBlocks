@@ -65,7 +65,8 @@ the HomeStore data journal (zero-copy, out-of-order tolerant), so that replicas 
 independently journal writes broadcast by the client.
 
 **Acceptance criteria:**
-- `write(term, lsn, lba, len, data)`: allocate blks up front, write the payload **once** via the data service (zero-copy), then journal the reference record `{term, lsn, lba, len, blkid}` at the `lsn` slot; ACK on journal-append completion (homestore's `HS_DATA_LINKED` pattern; the journal entry is header + key + serialized blkids only, payload never enters the journal)
+- `write(term, lsn, lba, len, data)`: allocate blks up front, write the payload **once** via the data service (zero-copy), then journal the reference record `{term, lsn, lba, len, blkid}` at the `lsn` slot; ACK on journal-append completion (homestore's `HS_DATA_LINKED` pattern; the journal entry is header + key + serialized blkids only, payload never enters the journal). The ACK **returns the achieved `{commit_lsn, last_append_lsn}`** — every CRAFT IO response piggybacks the watermarks (the wire's `write_rsp`)
+- **Empty-verdict tombstone:** a slot verdicted `Empty` (S5) is a permanent no-op hole; `write()` REJECTS a late arrival into it (reconciliation: Empty beats data), so a write a resolution round voided fails deterministically on its own ack path
 - Truncate (S4) and Empty-discard free the referenced blks; a crash between the data write and the journal append leaves only uncommitted blks, which homestore recovery reclaims
 - Rejects with `ETERM` if `term != state.term`
 - Updates `last_append_lsn = max(last_append_lsn, lsn)`
@@ -88,7 +89,7 @@ peer. See the CRAFT Design wiki page for the model.
 **Acceptance criteria:**
 - `commit(term, lsn)`: advances the contiguous commit watermark `commit_lsn` (≡ Synced) by applying present entries **strictly in dLSN order** (skipping Empty slots) and reclaiming superseded blocks (a data entry applies as an index insert; a zero `all_zeros` entry as an index delete / range unmap); **returns the achieved `{commit_lsn, last_append_lsn}`** (best-effort: `commit_lsn` stalls just below the first Missing hole, not an error; only apply + reclaim pause, never reads). The index is never written out of order, so no per-entry version checks are needed and the index at any CP is an exact prefix.
 - `keep_alive(commit_lsn, all_committed_lsn)`: same as commit + resets the client-timeout watchdog timer; **returns `{commit_lsn, last_append_lsn}`** (feeds the reconfig promotion gate). `all_committed_lsn` (set-wide min, client-computed) lets the replica reclaim journal below `min(all_committed_lsn, checkpointed apply frontier)`.
-- `read(term, readLSN, lba, len)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range, from the index if applied or from the **journal-tail overlay** if only Appended (overlay read; **no index write on the read path**). No peer fetch on the read path.
+- `read(term, readLSN, lba, len, dest)`: returns the latest version ≤ `readLSN` (horizon `H`) for the range, from the index if applied or from the **journal-tail overlay** if only Appended (overlay read; **no index write on the read path**). Fills the caller-owned `dest` in place and returns `craft::read_result` — the sparse layout **plus the piggybacked `{commit_lsn, last_append_lsn}`**. No peer fetch on the read path.
 - **Thin reads (sparse + holes):** the result is data extents interleaved with **holes** for sub-ranges with no data (never written, a committed `all_zeros` write, or an all-zero region collapsed by a read-time scan); a hole is a marker, never a materialized zero buffer, and is **not** `Missing`. The read-time scan is the only zero-scan on the server (the write path never re-scans).
 - **Server-side horizon clamp:** the replica serves only versions ≤ `readLSN`; a sub-quorum tail write above it (held in the overlay) is never returned. Unit test: with a locally-held write at LSN X, a read at `readLSN < X` returns the ≤`readLSN` version, not the held one.
 - **Journal-tail overlay:** in-memory map (LBA → highest-dLSN unapplied entry) over `(commit_lsn, last_append]`; consulted by reads, updated on append/apply/truncate.
@@ -133,7 +134,7 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 - **Leader pre-resolution:** before proposing `N`, the leader resolves every unresolved slot ≤ `N`: fetch it from any holder, or record an `Empty` verdict on quorum-lacks evidence (leader counts itself; non-responders never count); it must not propose past an unresolved slot
 - On apply: verify token; mark `empty_slots` Empty, **discarding any local data held there** (reconciliation); if behind, `fetch_data()` the remaining missing slots from peers; then `commit_lsn = rs_commit_lsn`. **Apply never truncates** and replicas **never declare Empty unilaterally**
 - `append(sync_to, client_token)` proposes this entry via RAFT
-- Triggers: periodic every N LSNs (configurable via `home_blks_config.fbs`, default 128), watchdog, login, **client-requested (after a failed sub-quorum write)**
+- Triggers: periodic every N LSNs (configurable via `home_blks_config.fbs`, default 128), watchdog, login, **client-requested (after a failed sub-quorum write)** — the client's `Resolve` RPC lands on `CraftReplDev::request_resolution(term, upto)`, which runs this same leader pre-resolution and returns the Empty verdicts ≤ `upto` (`craft::resolution_result`). The client broadcasts it to every member (it cannot know the leader mid-session); a follower returns `NOT_LEADER`
 
 **InternalLogin:**
 - RAFT entry carries `{client_token, term}`
@@ -218,8 +219,9 @@ the RPC layer and storage layer have a clean boundary with no storage logic in t
 
 **Acceptance criteria:**
 - `CraftConnector` class exists; transport is pluggable (CRAFT-1 spike determines final choice)
-- Client-facing handlers: `Login`, `Write`, `Read`, `KeepAlive` (there is no `Commit` verb: the watermark
-  rides on `client_hdr.commit_lsn`, see [rpcs.md](rpcs.md))
+- Client-facing handlers: `Login` (routes by the request's `volume_id`), `Write`, `Read`, `KeepAlive`,
+  `Resolve` (there is no `Commit` verb: the watermark rides on `client_hdr.commit_lsn`, see
+  [rpcs.md](rpcs.md))
 - Server-to-server handlers: `GetRSCommitLSN`, `FetchData`, `GetLSNs` (used during login and resync)
 - Each handler translates NubloxProto types ↔ `CraftReplDev` types with no storage logic
 - Leader redirect: if a `Login` arrives at a follower, return leader endpoint

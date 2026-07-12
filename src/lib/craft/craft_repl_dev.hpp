@@ -62,13 +62,33 @@ public:
     async_result< craft::LoginResult > login(uint64_t client_token, volume_id_t vol_id);
 
     // Append data to the journal at the client-assigned LSN slot. Zero-copy;
-    // does NOT apply data to the LBA index.
-    async_status write(uint64_t term, int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data);
+    // does NOT apply data to the LBA index. The ack returns the achieved
+    // {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT
+    // IO response piggybacks the watermarks (the wire's write_rsp), so any
+    // round-trip refreshes the client's model of this member.
+    async_result< craft::lsn_pair > write(uint64_t term, int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data);
 
     // read_lsn is the horizon H: serve the latest version <= H for the range,
     // from the LBA index if applied or from the journal-tail overlay if only
     // Appended (no index write on the read path). Never fetches from a peer.
-    async_result< sisl::sg_list > read(uint64_t term, int64_t read_lsn, lba_t lba, lba_count_t len);
+    // Fills the caller-owned `dest` buffer in place (data -> bytes, holes ->
+    // zeros) and returns craft::read_result: the sparse layout (extents in
+    // BYTES -- the byte<->block conversion stays confined here) plus the
+    // piggybacked {commit_lsn, last_append_lsn}.
+    async_result< craft::read_result > read(uint64_t term, int64_t read_lsn, lba_t lba, lba_count_t len,
+                                            sisl::sg_list dest);
+
+    // The client-requested resolution round (the wire's RESOLVE; the design's
+    // client-request SyncRSCommitLSN trigger). LEADER-only: resolve every
+    // unresolved slot <= upto -- fetch it from a holder, or verdict it Empty on
+    // quorum-lacks evidence -- using the SAME pre-resolution machinery the
+    // SyncRSCommitLSN proposer (S5) needs, then propose the entry carrying the
+    // verdicts. The client broadcasts this to every member (it cannot know who
+    // leads mid-session): a follower returns craft_error::NOT_LEADER (or, once
+    // peer channels exist, may forward to its leader). Returns the Empty
+    // verdicts <= upto; a late write into an Empty-verdicted slot is REJECTED
+    // (reconciliation: Empty beats data). Term-fenced.
+    async_result< craft::resolution_result > request_resolution(uint64_t term, int64_t upto);
 
     // Advance the contiguous commit watermark toward lsn: apply present entries
     // strictly in dLSN order (skip Empty), reclaim superseded blocks. Best-effort:

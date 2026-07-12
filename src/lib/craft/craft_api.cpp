@@ -43,16 +43,15 @@ async_status logout(volume_handle const& vol, craft::client_hdr hdr) {
     co_return co_await b->logout(hdr);
 }
 
-async_status async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
-                         sisl::sg_list data) {
+async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn,
+                                            uint64_t addr, uint64_t len, sisl::sg_list data) {
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->write(hdr, dlsn, addr, len, std::move(data));
 }
 
-async_result< std::vector< craft::io_extent > > async_read(volume_handle const& vol, craft::client_hdr hdr,
-                                                           int64_t read_lsn, uint64_t addr, uint64_t len,
-                                                           sisl::sg_list dest) {
+async_result< craft::read_result > async_read(volume_handle const& vol, craft::client_hdr hdr, int64_t read_lsn,
+                                              uint64_t addr, uint64_t len, sisl::sg_list dest) {
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->read(hdr, read_lsn, addr, len, std::move(dest));
@@ -62,6 +61,13 @@ async_result< craft::lsn_pair > keep_alive(volume_handle const& vol, craft::clie
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->keep_alive(hdr);
+}
+
+async_result< craft::resolution_result > request_resolution(volume_handle const& vol, craft::client_hdr hdr,
+                                                            int64_t upto) {
+    auto* b = craft_backend_of(vol);
+    if (!b) co_return no_craft_backend();
+    co_return co_await b->request_resolution(hdr, upto);
 }
 
 } // namespace homeblocks

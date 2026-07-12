@@ -18,7 +18,7 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 |---|---|
 | [protocol.md](protocol.md) | Pointer to the canonical [CRAFT Design](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design) wiki page |
 | [api.md](api.md) | HomeBlocks C++ CRAFT API (`CraftReplDev` methods) |
-| [rpcs.md](rpcs.md) | All 8 RPCs (client↔server and server↔server) |
+| [rpcs.md](rpcs.md) | All 9 RPCs (client↔server and server↔server) |
 | wire.md | On-wire byte encoding of the client RPCs — **moved to the `craft_client` repo** (`docs/wire.md`), which now owns the wire protocol. |
 | transport.md | TCP transport binding behavior — **moved to the `craft_client` repo** (`docs/transport.md`). |
 | [states.md](states.md) | Pointer to the canonical wiki page (slot states, read eligibility) |
@@ -44,9 +44,10 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | **Empty** | A dLSN proven never quorum-durable, declared by the leader; a permanent no-op the commit skips. |
 | **zero write (all_zeros)** | A payload-free write naming just a byte range (WRITE_ZEROES / discard-to-zero), signaled by an **empty `sisl::sg_list`** (no `all_zeros` flag). Takes a dLSN and merges like any write; allocates nothing and unmaps its range on apply, reading back as a hole. |
 | **hole** | A read sub-range with no data (never written, zero-written, or an all-zero region collapsed at read time). Returned as a marker, read as zeros; **not** the same as `Missing`. |
-| **client_hdr** | The session + watermark fields stamped on every client IO: `{term, commit_lsn, all_committed_lsn}` (see the commit note below). |
+| **client_hdr** | The session + watermark fields stamped on every client IO: `{term, commit_lsn, all_committed_lsn}` (see the commit note below). Every IO **response** mirrors it with the replica's achieved `{commit_lsn, last_append_lsn}`. |
 | **lba_size** | The volume block size in bytes, returned by `login`; the client aligns every byte `addr`/`len` to it and presents the geometry to the filesystem. |
 | **io_extent** | One sub-range of a read's sparse layout, in **bytes**: `{addr, len, hole}` — carries no bytes (they are in the caller's buffer). |
+| **Resolve / request_resolution** | The client-requested resolution round (the client-request `SyncRSCommitLSN` trigger), fired after a failed sub-quorum write and broadcast to every member; the current leader fills each unresolved slot from a holder or verdicts it Empty. |
 
 ## Key design properties
 

@@ -36,7 +36,7 @@
 #include <sisl/utility/enum.hpp>
 #include <homestore/error.hpp> // result / async_result / status / ok
 
-#include <craft/types.hpp> // the CRAFT client-facing vocab, used qualified: craft::LoginResult / client_hdr / io_extent / lsn_pair / craft_error (HomeStore-free)
+#include <craft/types.hpp> // the CRAFT client-facing vocab, used qualified: craft::LoginResult / client_hdr / io_extent / read_result / resolution_result / lsn_pair / craft_error (HomeStore-free)
 
 // Declares the homeblocks logging module so consumers can wire its log level into their own logging init. The
 // per-call LOG* shorthand macros are internal (lib/hb_internal.hpp) and intentionally not exposed here.
@@ -177,18 +177,34 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // a hole); non-empty data is a data write of exactly `len` bytes -- so the empty buffer, not a flag,
 // signals a zero write. Not applied to the index directly; `hdr.commit_lsn` rides along and advances the
 // frontier best-effort in dLSN order (CRAFT's piggybacked commit). STALE_TERM if hdr.term != session term.
-[[nodiscard]] async_status async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn, uint64_t addr,
-                                       uint64_t len, sisl::sg_list data);
+// The ack returns the replica's achieved {commit_lsn, last_append_lsn}: every CRAFT IO response piggybacks
+// the watermarks, so any round-trip refreshes the client's per-member model without a keep_alive.
+[[nodiscard]] async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::client_hdr hdr,
+                                                          int64_t dlsn, uint64_t addr, uint64_t len,
+                                                          sisl::sg_list data);
 
 // Read the latest version <= `read_lsn` (horizon H) for [addr, addr+len) (BYTE offset/length, aligned to
 // lba_size). Fills the caller-owned `dest` buffer in place -- data sub-ranges get their bytes, holes get
-// zeros -- and returns the sparse layout (which byte sub-ranges were data vs holes; the thin/hole info).
-// Served from the index or the journal-tail overlay; never fetches from a peer. Advances the frontier to
-// hdr.commit_lsn (piggybacked commit). std::errc::invalid_argument if addr/len are misaligned.
-[[nodiscard]] async_result< std::vector< craft::io_extent > > async_read(volume_handle const& vol,
-                                                                         craft::client_hdr hdr, int64_t read_lsn,
-                                                                         uint64_t addr, uint64_t len,
-                                                                         sisl::sg_list dest);
+// zeros -- and returns craft::read_result: the sparse layout (which byte sub-ranges were data vs holes; the
+// thin/hole info) PLUS the replica's piggybacked {commit_lsn, last_append_lsn}, snapshotted atomically with
+// the read. Served from the index or the journal-tail overlay; never fetches from a peer. Advances the
+// frontier to hdr.commit_lsn (piggybacked commit). std::errc::invalid_argument if addr/len are misaligned.
+[[nodiscard]] async_result< craft::read_result > async_read(volume_handle const& vol, craft::client_hdr hdr,
+                                                            int64_t read_lsn, uint64_t addr, uint64_t len,
+                                                            sisl::sg_list dest);
+
+// The client-requested resolution round (the design's client-request SyncRSCommitLSN trigger): resolve
+// every unresolved slot <= `upto` NOW -- fetch each from a holder, or verdict it Empty on quorum-lacks
+// evidence -- instead of waiting for the watchdog / periodic cadence. The round is LEADER work, but the
+// client cannot know who leads mid-session (it learned a leader at login; leadership may have moved), so it
+// BROADCASTS this to every member with at most one outstanding per member: whichever member is the current
+// leader runs the round, and a follower returns craft_error::NOT_LEADER (a server may instead forward to
+// its leader). Returns the Empty verdicts <= upto; every other formerly-unresolved slot was filled from a
+// holder and is durable (the failed write completed late). A replica REJECTS a late write into an
+// Empty-verdicted slot (reconciliation: Empty beats data), so a voided write fails deterministically on its
+// own ack path. Term-fenced (STALE_TERM).
+[[nodiscard]] async_result< craft::resolution_result > request_resolution(volume_handle const& vol,
+                                                                          craft::client_hdr hdr, int64_t upto);
 
 // Advance the frontier toward hdr.commit_lsn (best-effort; stalls below the first hole) and reset the
 // client-liveness watchdog (hence it is term-fenced). hdr.all_committed_lsn floors journal reclaim.
