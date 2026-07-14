@@ -239,7 +239,7 @@ jobs:
         popd
         pushd import/ublkpp
         ./prepare_v2.sh
-        conan export --user oss --channel ${{ inputs.conan-channel }}
+        conan export --user oss --channel main
         popd
         pushd import/homestore
         conan export --user oss --channel ${{ inputs.conan-channel }}
