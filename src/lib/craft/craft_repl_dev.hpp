@@ -18,9 +18,14 @@
 #include <homestore/replication/repl_dev.hpp>
 
 #include <atomic>
+#include <initializer_list>
 #include <mutex>
 #include <set>
 #include <vector>
+
+namespace homestore {
+class home_log_store;
+}
 
 namespace homeblocks {
 
@@ -67,14 +72,20 @@ class CraftJournalBackend {
 public:
     virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data) = 0;
     virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
+    // Drop all entries with seq_num > lsn; lsn becomes the new journal tail.
     virtual async_status truncate_to(int64_t lsn) = 0;
     virtual ~CraftJournalBackend() = default;
 };
 
+// Factory that wraps a HomeStore log store. Used by volume.cpp when creating a CRAFT-mode volume.
+// Tests inject MockCraftJournalBackend directly.
+unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore);
+
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
-// Parallel to HomeStore's ReplDisk. Each CRAFT-mode volume owns one instance
-// instead of the solo repl_dev. Non-CRAFT volumes are unaffected.
+// One instance per CRAFT-mode volume. Implements the full CRAFT data plane
+// (write, read, login, truncate, ...) on top of a HomeStore log store and
+// index. Non-CRAFT volumes are unaffected.
 
 class CraftReplDev {
 public:
@@ -140,7 +151,8 @@ public:
     // Alias of get_lsns exposed to peer servers during GetRSCommitLSN broadcast.
     async_result< craft::lsn_pair > get_rs_commit_lsn();
 
-    // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn.
+    // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn.
+    // Called only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
     async_status truncate(int64_t lsn);
 
     // Propose a SyncRSCommitLSN RAFT entry (called by watchdog or leader during login).
@@ -149,6 +161,33 @@ public:
     // Return raw journal data for the requested LSNs. Empty slots return
     // JournalSlot{.is_empty=true} rather than an error.
     async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns);
+
+    // ── observability ─────────────────────────────────────────────────────
+
+    size_t missing_count() const {
+        std::lock_guard lk{missing_mu_};
+        return missing_lsns_.size();
+    }
+
+    bool is_missing(int64_t lsn) const {
+        std::lock_guard lk{missing_mu_};
+        return missing_lsns_.contains(lsn);
+    }
+
+    int64_t last_append_lsn() const {
+        std::lock_guard lk{missing_mu_};
+        return state_.last_append_lsn;
+    }
+    int64_t commit_lsn() const {
+        std::lock_guard lk{missing_mu_};
+        return state_.commit_lsn;
+    }
+
+#ifdef _PRERELEASE
+    // Seeds partition watermarks and the missing set directly, bypassing write().
+    // Only compiled when _PRERELEASE is defined; never present in production binaries.
+    void seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing = {});
+#endif
 
 private:
     // ── RAFT listener ──────────────────────────────────────────────────────
@@ -215,7 +254,7 @@ private:
     unique< CraftJournalBackend > journal_;
     CraftPartitionState state_;
     std::set< int64_t > missing_lsns_; // gaps between commit_lsn and last_append_lsn
-    std::mutex missing_mu_;
+    mutable std::mutex missing_mu_;
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
