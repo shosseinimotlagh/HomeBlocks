@@ -174,6 +174,11 @@ public:
         return missing_lsns_.contains(lsn);
     }
 
+    bool is_empty_slot(int64_t lsn) const {
+        std::lock_guard lk{missing_mu_};
+        return empty_lsns_.contains(lsn);
+    }
+
     int64_t last_append_lsn() const {
         std::lock_guard lk{missing_mu_};
         return state_.last_append_lsn;
@@ -187,6 +192,10 @@ public:
     // Seeds partition watermarks and the missing set directly, bypassing write().
     // Only compiled when _PRERELEASE is defined; never present in production binaries.
     void seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing = {});
+    // Seeds commit_lsn independently of seed_lsns (which only touches last_append + missing).
+    void seed_commit_lsn(int64_t commit);
+    // Seeds the Empty-verdict set; does not affect missing_lsns_. Clears any prior seeded empties.
+    void seed_empty(std::initializer_list< int64_t > empty);
 #endif
 
 private:
@@ -254,7 +263,8 @@ private:
     unique< CraftJournalBackend > journal_;
     CraftPartitionState state_;
     std::set< int64_t > missing_lsns_; // gaps between commit_lsn and last_append_lsn
-    mutable std::mutex missing_mu_;
+    std::set< int64_t > empty_lsns_;   // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
+    mutable std::mutex missing_mu_;    // guards state_, missing_lsns_, and empty_lsns_
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
