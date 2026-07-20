@@ -96,13 +96,19 @@ async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn() {
 // journal and the missing set.
 
 async_status CraftReplDev::truncate(int64_t lsn) {
+    // Guard before touching the journal: truncating below commit_lsn would drop
+    // committed entries and break the commit_lsn <= last_append_lsn invariant.
+    {
+        std::lock_guard lk{missing_mu_};
+        DEBUG_ASSERT_GE(lsn, state_.commit_lsn, "truncate below committed prefix");
+    }
+
     // Step 1: journal rollback — synchronous; fails fast on I/O error.
     if (auto r = co_await journal_->truncate_to(lsn); !r) co_return r;
 
     // Steps 2 + 3 under the same mutex write() uses.
     {
         std::lock_guard lk{missing_mu_};
-        DEBUG_ASSERT_GE(lsn, state_.commit_lsn, "truncate below committed prefix");
         if (state_.last_append_lsn > lsn) state_.last_append_lsn = lsn;
         missing_lsns_.erase(missing_lsns_.upper_bound(lsn), missing_lsns_.end());
     }
