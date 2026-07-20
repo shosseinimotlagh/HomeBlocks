@@ -13,3 +13,5 @@ target_link_libraries(${PROJECT_NAME}_craft
 # (the volume_handle free functions) and craft_repl_dev.cpp is the engine behind it. The CRAFT client, the wire
 # codec, the in-memory reference model and the reference server all live in the standalone craft_client package;
 # the ublk driver lives in ublkpp. None of them are built or linked here.
+
+add_subdirectory(tests)
