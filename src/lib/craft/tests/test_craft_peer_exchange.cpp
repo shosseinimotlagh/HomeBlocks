@@ -204,6 +204,19 @@ TEST_F(CraftPeerExchangeTest, FetchDataAboveLastAppendOmitted) {
     EXPECT_TRUE(r->empty());
 }
 
+// An Empty verdict applied by S5 for a slot this peer never received (above last_append_lsn)
+// must return is_empty=true, not be omitted. The Empty check must precede the range guard.
+TEST_F(CraftPeerExchangeTest, FetchDataEmptyAboveLastAppend) {
+    dev_->seed_lsns(10, {});  // peer only saw up to lsn 10
+    dev_->seed_empty({15});   // S5 verdicted lsn 15 Empty; this peer never received the write
+
+    auto r = do_fetch_data({15});
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].lsn, 15);
+    EXPECT_TRUE((*r)[0].is_empty);
+}
+
 // A slot positively verdicted Empty (by a prior S5 apply) is returned with is_empty=true,
 // even when the slot is also in missing_lsns_ (the peer never received the write data).
 TEST_F(CraftPeerExchangeTest, FetchDataEmptySlot) {
@@ -256,7 +269,7 @@ TEST_F(CraftPeerExchangeTest, FetchDataMixedRequest) {
 TEST_F(CraftPeerExchangeTest, FetchDataReadErrorPropagates) {
     add_slot(1, 0, 4);
     add_slot(2, 0, 4);
-    dev_->seed_lsns(3, {});
+    dev_->seed_lsns(2, {});
     journal_->fail_on_read = 2; // reading lsn=2 returns io_error
 
     auto r = do_fetch_data({1, 2, 3});
